@@ -36,10 +36,15 @@ package unionstore
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
+	"os"
+	"runtime/pprof"
 	"unsafe"
 
+	"github.com/tikv/client-go/v2/internal/logutil"
 	"github.com/tikv/client-go/v2/kv"
+	"go.uber.org/zap"
 )
 
 const (
@@ -60,8 +65,17 @@ type memdbArenaAddr struct {
 	off uint32
 }
 
+func isBadAddr(addr memdbArenaAddr) bool {
+	return addr != nullAddr && (addr.idx == math.MaxUint32 || addr.off == math.MaxUint32)
+}
+
 func (addr memdbArenaAddr) isNull() bool {
-	return addr == nullAddr
+	ok := addr == nullAddr
+	if !ok && (addr.idx == math.MaxUint32 || addr.off == math.MaxUint32) {
+		pprof.Lookup("goroutine").WriteTo(os.Stdout, 2)
+		logutil.BgLogger().Panic(">>> bad addr", zap.Stack("stack"))
+	}
+	return ok
 }
 
 // store and load is used by vlog, due to pointer in vlog is not aligned.
@@ -69,11 +83,21 @@ func (addr memdbArenaAddr) isNull() bool {
 func (addr memdbArenaAddr) store(dst []byte) {
 	endian.PutUint32(dst, addr.idx)
 	endian.PutUint32(dst[4:], addr.off)
+	if isBadAddr(addr) {
+		logutil.BgLogger().Info(">>> store bad addr", zap.String("addr", addr.String()), zap.Stack("stack"))
+	}
+}
+
+func (addr memdbArenaAddr) String() string {
+	return fmt.Sprintf("[%d,%d]", addr.idx, addr.off)
 }
 
 func (addr *memdbArenaAddr) load(src []byte) {
 	addr.idx = endian.Uint32(src)
 	addr.off = endian.Uint32(src[4:])
+	if isBadAddr(*addr) {
+		logutil.BgLogger().Info(">>> load bad addr", zap.String("addr", addr.String()), zap.Stack("stack"))
+	}
 }
 
 type memdbArena struct {
@@ -206,6 +230,12 @@ func (a *nodeAllocator) init() {
 }
 
 func (a *nodeAllocator) getNode(addr memdbArenaAddr) *memdbNode {
+	origAddr := addr
+	defer func() {
+		if e := recover(); e != nil {
+			logutil.BgLogger().Sugar().Panicf(">>> addr=%s, orig=%s, null=%s", addr.String(), origAddr.String(), nullAddr.String())
+		}
+	}()
 	if addr.isNull() {
 		return &a.nullNode
 	}
@@ -220,6 +250,9 @@ func (a *nodeAllocator) allocNode(key []byte) (memdbArenaAddr, *memdbNode) {
 	n.vptr = nullAddr
 	n.klen = uint16(len(key))
 	copy(n.getKey(), key)
+	if isBadAddr(addr) {
+		logutil.BgLogger().Info(">>> alloc node with bad addr", zap.String("addr", addr.String()), zap.Stack("stack"))
+	}
 	return addr, n
 }
 
@@ -278,6 +311,9 @@ func (hdr *memdbVlogHdr) load(src []byte) {
 func (l *memdbVlog) appendValue(nodeAddr memdbArenaAddr, oldValue memdbArenaAddr, value []byte) memdbArenaAddr {
 	size := memdbVlogHdrSize + len(value)
 	addr, mem := l.alloc(size, false)
+	if isBadAddr(addr) {
+		logutil.BgLogger().Info(">>> append value with bad addr", zap.String("addr", addr.String()), zap.Stack("stack"))
+	}
 
 	copy(mem, value)
 	hdr := memdbVlogHdr{nodeAddr, oldValue, uint32(len(value))}
@@ -353,6 +389,9 @@ func (l *memdbVlog) inspectKVInLog(db *MemDB, head, tail *memdbCheckpoint, f fun
 	cursor := *tail
 	for !head.isSamePosition(&cursor) {
 		cursorAddr := memdbArenaAddr{idx: uint32(cursor.blocks - 1), off: uint32(cursor.offsetInBlock)}
+		if isBadAddr(cursorAddr) {
+			logutil.BgLogger().Info(">>> bad cursor addr", zap.String("addr", cursorAddr.String()), zap.Stack("stack"))
+		}
 		hdrOff := cursorAddr.off - memdbVlogHdrSize
 		block := l.blocks[cursorAddr.idx].buf
 		var hdr memdbVlogHdr

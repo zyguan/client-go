@@ -42,6 +42,7 @@ import (
 	"unsafe"
 
 	tikverr "github.com/tikv/client-go/v2/error"
+	"github.com/tikv/client-go/v2/internal/logutil"
 	"github.com/tikv/client-go/v2/kv"
 )
 
@@ -59,6 +60,9 @@ type MemKeyHandle struct {
 }
 
 func (h MemKeyHandle) toAddr() memdbArenaAddr {
+	if h.off == math.MaxUint32 {
+		logutil.BgLogger().Sugar().Infof(">>> h.off is max u32")
+	}
 	return memdbArenaAddr{idx: uint32(h.idx), off: h.off}
 }
 
