@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 	"unsafe"
 
@@ -225,4 +226,8 @@ func None[T interface{}]() Option[T] {
 
 func (o Option[T]) Inner() *T {
 	return o.inner
+}
+
+func InTest() bool {
+	return testing.Testing()
 }
