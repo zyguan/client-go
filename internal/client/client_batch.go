@@ -39,6 +39,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"runtime/trace"
 	"sync"
 	"sync/atomic"
@@ -274,6 +275,21 @@ func (a *batchConn) fetchAllPendingRequests(
 	ts := time.Now()
 	a.reqBuilder.push(headEntry)
 
+	if minBatchDuration > 0 {
+		timeout := time.After(minBatchDuration)
+		for a.reqBuilder.len() < maxBatchSize {
+			select {
+			case <-timeout:
+				return ts
+			case entry := <-a.batchCommandsCh:
+				if entry == nil {
+					return ts
+				}
+				a.reqBuilder.push(entry)
+			}
+		}
+		return ts
+	}
 	// This loop is for trying best to collect more requests.
 	for a.reqBuilder.len() < maxBatchSize {
 		select {
@@ -287,6 +303,21 @@ func (a *batchConn) fetchAllPendingRequests(
 		}
 	}
 	return ts
+}
+
+var minBatchDuration time.Duration
+
+func init() {
+	s := os.Getenv("KV_CLIENT_MIN_BATCH_DURATION")
+	if len(s) > 0 {
+		dur, err := time.ParseDuration(s)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "set min-batch-duration failed: %v\n", err)
+			return
+		}
+		minBatchDuration = dur
+		fmt.Fprintf(os.Stderr, "set min-batch-duration: %v\n", dur)
+	}
 }
 
 // fetchMorePendingRequests fetches more pending requests from the channel.

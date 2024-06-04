@@ -662,10 +662,15 @@ func (s *KVSnapshot) get(ctx context.Context, bo *retry.Backoffer, k []byte) ([]
 			s.mergeRegionRequestStats(cli.Stats)
 		}()
 	}
+	var flags = uint32(0)
+	if globalCacheEnabled && s.version != math.MaxUint64 {
+		flags |= uint32(kvrpcpb.GetFlags_NEED_DATA_VERSION)
+	}
 	req := tikvrpc.NewReplicaReadRequest(tikvrpc.CmdGet,
 		&kvrpcpb.GetRequest{
 			Key:     k,
 			Version: s.version,
+			Flags:   flags,
 		}, s.mu.replicaRead, &s.replicaReadSeed, kvrpcpb.Context{
 			Priority:         s.priority.ToPB(),
 			NotFillCache:     s.notFillCache,
@@ -711,6 +716,18 @@ func (s *KVSnapshot) get(ctx context.Context, bo *retry.Backoffer, k []byte) ([]
 		loc, err := s.store.GetRegionCache().LocateKey(bo, k)
 		if err != nil {
 			return nil, err
+		}
+		if globalCacheEnabled && s.version != math.MaxUint64 {
+			start := time.Now()
+			val, ok := globalCache.Read(k, s.version)
+			globalCacheOverheadRead.Observe(time.Since(start).Seconds())
+			if ok {
+				globalCacheEventHit.Inc()
+				if len(val) == 0 {
+					return nil, tikverr.ErrNotExist
+				}
+				return val, nil
+			}
 		}
 		timeout := client.ReadTimeoutShort
 		if useConfigurableKVTimeout && s.readTimeout > 0 {
@@ -799,6 +816,15 @@ func (s *KVSnapshot) get(ctx context.Context, bo *retry.Backoffer, k []byte) ([]
 				}
 			}
 			continue
+		}
+		if version := cmdGetResp.GetVersion(); globalCacheEnabled && version > 0 {
+			start := time.Now()
+			readTS := s.version
+			if globalCacheUnsafePatchReadTS > 0 {
+				readTS += oracle.ComposeTS(globalCacheUnsafePatchReadTS, 0)
+			}
+			globalCache.Update(k, val, version, readTS)
+			globalCacheOverheadUpdate.Observe(time.Since(start).Seconds())
 		}
 		return val, nil
 	}
