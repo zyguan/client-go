@@ -40,6 +40,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
+	"os"
 	"runtime/trace"
 	"strconv"
 	"strings"
@@ -47,6 +49,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cloudwego/netpoll"
 	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/kvproto/pkg/coprocessor"
@@ -336,6 +339,11 @@ func (a *connArray) Init(addr string, security config.Security, idleNotify *uint
 		}, opts...)
 		if cfg.TiKVClient.GrpcSharedBufferPool {
 			opts = append(opts, experimental.WithRecvBufferPool(grpc.NewSharedBufferPool()))
+		}
+		if strings.ToLower(os.Getenv("TIKV_CLIENT_MODE")) == "netpoll" {
+			opts = append(opts, grpc.WithContextDialer(func(ctx context.Context, s string) (net.Conn, error) {
+				return netpoll.DialConnection("tcp", s, a.dialTimeout)
+			}))
 		}
 		conn, err := a.monitoredDial(
 			ctx,
