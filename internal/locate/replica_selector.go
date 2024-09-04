@@ -50,10 +50,10 @@ func newReplicaSelector(
 	replicas := buildTiKVReplicas(cachedRegion)
 	option := storeSelectorOp{}
 	for _, op := range opts {
-		op(&option)
+		option = op(option)
 	}
 	if req.ReplicaReadType == kv.ReplicaReadPreferLeader {
-		WithPerferLeader()(&option)
+		option = WithPerferLeader()(option)
 	}
 	return &replicaSelector{
 		baseReplicaSelector: baseReplicaSelector{

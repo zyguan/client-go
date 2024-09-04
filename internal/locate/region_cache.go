@@ -259,7 +259,7 @@ func (r *regionStore) clone() *regionStore {
 }
 
 // return next follower store's index
-func (r *regionStore) follower(seed uint32, op *storeSelectorOp) AccessIndex {
+func (r *regionStore) follower(seed uint32, op storeSelectorOp) AccessIndex {
 	l := uint32(r.accessStoreNum(tiKVOnly))
 	if l <= 1 {
 		return r.workTiKVIdx
@@ -280,7 +280,7 @@ func (r *regionStore) follower(seed uint32, op *storeSelectorOp) AccessIndex {
 }
 
 // return next leader or follower store's index
-func (r *regionStore) kvPeer(seed uint32, op *storeSelectorOp) AccessIndex {
+func (r *regionStore) kvPeer(seed uint32, op storeSelectorOp) AccessIndex {
 	if op.leaderOnly {
 		return r.workTiKVIdx
 	}
@@ -300,7 +300,7 @@ func (r *regionStore) kvPeer(seed uint32, op *storeSelectorOp) AccessIndex {
 	return candidates[seed%uint32(len(candidates))]
 }
 
-func (r *regionStore) filterStoreCandidate(aidx AccessIndex, op *storeSelectorOp) bool {
+func (r *regionStore) filterStoreCandidate(aidx AccessIndex, op storeSelectorOp) bool {
 	_, s := r.accessStore(tiKVOnly, aidx)
 	// filter label unmatched store and slow stores when ReplicaReadMode == PreferLeader
 	return s.IsLabelsMatch(op.labels) && (!op.preferLeader || (aidx == r.workTiKVIdx && !s.healthStatus.IsSlow()))
@@ -821,42 +821,57 @@ type storeSelectorOp struct {
 }
 
 // StoreSelectorOption configures storeSelectorOp.
-type StoreSelectorOption func(*storeSelectorOp)
+type StoreSelectorOption func(storeSelectorOp) storeSelectorOp
 
 // WithMatchLabels indicates selecting stores with matched labels.
 func WithMatchLabels(labels []*metapb.StoreLabel) StoreSelectorOption {
-	return func(op *storeSelectorOp) {
+	return func(op storeSelectorOp) storeSelectorOp {
 		op.labels = append(op.labels, labels...)
+		return op
 	}
 }
 
 // WithLeaderOnly indicates selecting stores with leader only.
 func WithLeaderOnly() StoreSelectorOption {
-	return func(op *storeSelectorOp) {
+	return func(op storeSelectorOp) storeSelectorOp {
 		op.leaderOnly = true
+		return op
 	}
 }
 
 // WithPerferLeader indicates selecting stores with leader as priority until leader unaccessible.
 func WithPerferLeader() StoreSelectorOption {
-	return func(op *storeSelectorOp) {
+	return func(op storeSelectorOp) storeSelectorOp {
 		op.preferLeader = true
+		return op
 	}
 }
 
 // WithMatchStores indicates selecting stores with matched store ids.
 func WithMatchStores(stores []uint64) StoreSelectorOption {
-	return func(op *storeSelectorOp) {
+	return func(op storeSelectorOp) storeSelectorOp {
 		op.stores = stores
+		return op
 	}
 }
 
 // GetTiKVRPCContext returns RPCContext for a region. If it returns nil, the region
 // must be out of date and already dropped from cache.
 func (c *RegionCache) GetTiKVRPCContext(bo *retry.Backoffer, id RegionVerID, replicaRead kv.ReplicaReadType, followerStoreSeed uint32, opts ...StoreSelectorOption) (*RPCContext, error) {
+	rpcContext, err := c.BuildTiKVRPCContext(bo, id, replicaRead, followerStoreSeed, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if rpcContext.ClusterID == 0 {
+		return nil, nil
+	}
+	return &rpcContext, nil
+}
+
+func (c *RegionCache) BuildTiKVRPCContext(bo *retry.Backoffer, id RegionVerID, replicaRead kv.ReplicaReadType, followerStoreSeed uint32, opts ...StoreSelectorOption) (RPCContext, error) {
 	cachedRegion := c.GetCachedRegionWithRLock(id)
 	if !cachedRegion.isValid() {
-		return nil, nil
+		return RPCContext{}, nil
 	}
 
 	regionStore := cachedRegion.getStore()
@@ -866,9 +881,9 @@ func (c *RegionCache) GetTiKVRPCContext(bo *retry.Backoffer, id RegionVerID, rep
 		storeIdx  int
 		accessIdx AccessIndex
 	)
-	options := &storeSelectorOp{}
+	options := storeSelectorOp{}
 	for _, op := range opts {
-		op(options)
+		options = op(options)
 	}
 	isLeaderReq := false
 	switch replicaRead {
@@ -885,7 +900,7 @@ func (c *RegionCache) GetTiKVRPCContext(bo *retry.Backoffer, id RegionVerID, rep
 	}
 	addr, err := c.getStoreAddr(bo, cachedRegion, store)
 	if err != nil {
-		return nil, err
+		return RPCContext{}, err
 	}
 	// enable by `curl -XPUT -d '1*return("[some-addr]")->return("")' http://host:port/tikvclient/injectWrongStoreAddr`
 	if val, err := util.EvalFailpoint("injectWrongStoreAddr"); err == nil {
@@ -896,7 +911,7 @@ func (c *RegionCache) GetTiKVRPCContext(bo *retry.Backoffer, id RegionVerID, rep
 	if store == nil || len(addr) == 0 {
 		// Store not found, region must be out of date.
 		cachedRegion.invalidate(StoreNotFound)
-		return nil, nil
+		return RPCContext{}, nil
 	}
 
 	storeFailEpoch := atomic.LoadUint32(&store.epoch)
@@ -905,7 +920,7 @@ func (c *RegionCache) GetTiKVRPCContext(bo *retry.Backoffer, id RegionVerID, rep
 		logutil.Logger(bo.GetCtx()).Info("invalidate current region, because others failed on same store",
 			zap.Uint64("region", id.GetID()),
 			zap.String("store", store.addr))
-		return nil, nil
+		return RPCContext{}, nil
 	}
 
 	var (
@@ -920,13 +935,13 @@ func (c *RegionCache) GetTiKVRPCContext(bo *retry.Backoffer, id RegionVerID, rep
 			if proxyStore != nil {
 				proxyAddr, err = c.getStoreAddr(bo, cachedRegion, proxyStore)
 				if err != nil {
-					return nil, err
+					return RPCContext{}, err
 				}
 			}
 		}
 	}
 
-	return &RPCContext{
+	return RPCContext{
 		ClusterID:  c.clusterID,
 		Region:     id,
 		Meta:       cachedRegion.meta,
@@ -2802,12 +2817,12 @@ func (r *Region) WorkStorePeer(rs *regionStore) (store *Store, peer *metapb.Peer
 }
 
 // FollowerStorePeer returns a follower store with follower peer.
-func (r *Region) FollowerStorePeer(rs *regionStore, followerStoreSeed uint32, op *storeSelectorOp) (store *Store, peer *metapb.Peer, accessIdx AccessIndex, storeIdx int) {
+func (r *Region) FollowerStorePeer(rs *regionStore, followerStoreSeed uint32, op storeSelectorOp) (store *Store, peer *metapb.Peer, accessIdx AccessIndex, storeIdx int) {
 	return r.getKvStorePeer(rs, rs.follower(followerStoreSeed, op))
 }
 
 // AnyStorePeer returns a leader or follower store with the associated peer.
-func (r *Region) AnyStorePeer(rs *regionStore, followerStoreSeed uint32, op *storeSelectorOp) (store *Store, peer *metapb.Peer, accessIdx AccessIndex, storeIdx int) {
+func (r *Region) AnyStorePeer(rs *regionStore, followerStoreSeed uint32, op storeSelectorOp) (store *Store, peer *metapb.Peer, accessIdx AccessIndex, storeIdx int) {
 	return r.getKvStorePeer(rs, rs.kvPeer(followerStoreSeed, op))
 }
 

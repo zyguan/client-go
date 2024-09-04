@@ -1409,7 +1409,7 @@ func (s *testRegionRequestToThreeStoresSuite) TestDoNotTryUnreachableLeader() {
 	s.Nil(err)
 	regionStore := region.getStore()
 	leader, _, _, _ := region.WorkStorePeer(regionStore)
-	follower, _, _, _ := region.FollowerStorePeer(regionStore, 0, &storeSelectorOp{})
+	follower, _, _, _ := region.FollowerStorePeer(regionStore, 0, storeSelectorOp{})
 
 	s.regionRequestSender.client = &fnClient{fn: func(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (response *tikvrpc.Response, err error) {
 		if req.StaleRead && addr == follower.addr {
@@ -1476,7 +1476,7 @@ func (s *testRegionRequestToThreeStoresSuite) TestPreferLeader() {
 	s.Equal("follower", string(resp.Resp.(*kvrpcpb.GetResponse).Value))
 
 	// access the rest follower when leader and one follower are unreachable
-	follower, _, _, _ := region.FollowerStorePeer(region.getStore(), 0, &storeSelectorOp{})
+	follower, _, _, _ := region.FollowerStorePeer(region.getStore(), 0, storeSelectorOp{})
 	atomic.StoreUint32(&follower.livenessState, uint32(unreachable))
 
 	resp, _, _, err = s.regionRequestSender.SendReqCtx(bo, req, loc.Region, time.Second, tikvrpc.TiKV)
@@ -1487,7 +1487,7 @@ func (s *testRegionRequestToThreeStoresSuite) TestPreferLeader() {
 	s.Equal("follower", string(resp.Resp.(*kvrpcpb.GetResponse).Value))
 
 	// return fake error when all peers are unreachable
-	follower, _, _, _ = region.FollowerStorePeer(region.getStore(), 1, &storeSelectorOp{})
+	follower, _, _, _ = region.FollowerStorePeer(region.getStore(), 1, storeSelectorOp{})
 	atomic.StoreUint32(&follower.livenessState, uint32(unreachable))
 
 	resp, _, _, err = s.regionRequestSender.SendReqCtx(bo, req, loc.Region, time.Second, tikvrpc.TiKV)
@@ -1511,7 +1511,7 @@ func (s *testRegionRequestToThreeStoresSuite) TestLeaderStuck() {
 	regionStore := region.getStore()
 	oldLeader, oldLeaderPeer, _, _ := region.WorkStorePeer(regionStore)
 	// The follower will become the new leader later
-	follower, followerPeer, _, _ := region.FollowerStorePeer(regionStore, 0, &storeSelectorOp{})
+	follower, followerPeer, _, _ := region.FollowerStorePeer(regionStore, 0, storeSelectorOp{})
 
 	currLeader := struct {
 		sync.Mutex
