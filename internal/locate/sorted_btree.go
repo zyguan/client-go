@@ -45,20 +45,20 @@ import (
 
 // SortedRegions is a sorted btree.
 type SortedRegions struct {
-	b *btree.BTreeG[*btreeItem]
+	b *btree.BTreeG[btreeItem]
 }
 
 // NewSortedRegions returns a new SortedRegions.
 func NewSortedRegions(btreeDegree int) *SortedRegions {
 	return &SortedRegions{
-		b: btree.NewG(btreeDegree, func(a, b *btreeItem) bool { return a.Less(b) }),
+		b: btree.NewG(btreeDegree, func(a, b btreeItem) bool { return a.Less(&b) }),
 	}
 }
 
 // ReplaceOrInsert inserts a new item into the btree.
 func (s *SortedRegions) ReplaceOrInsert(cachedRegion *Region) *Region {
-	old, _ := s.b.ReplaceOrInsert(newBtreeItem(cachedRegion))
-	if old != nil {
+	old, found := s.b.ReplaceOrInsert(newBtreeItem(cachedRegion))
+	if found {
 		return old.cachedRegion
 	}
 	return nil
@@ -66,7 +66,7 @@ func (s *SortedRegions) ReplaceOrInsert(cachedRegion *Region) *Region {
 
 // SearchByKey returns the region which contains the key. Note that the region might be expired and it's caller's duty to check the region TTL.
 func (s *SortedRegions) SearchByKey(key []byte, isEndKey bool) (r *Region) {
-	s.b.DescendLessOrEqual(newBtreeSearchItem(key), func(item *btreeItem) bool {
+	s.b.DescendLessOrEqual(newBtreeSearchItem(key), func(item btreeItem) bool {
 		region := item.cachedRegion
 		if isEndKey && bytes.Equal(region.StartKey(), key) {
 			return true // iterate next item
@@ -84,7 +84,7 @@ func (s *SortedRegions) SearchByKey(key []byte, isEndKey bool) (r *Region) {
 func (s *SortedRegions) AscendGreaterOrEqual(startKey, endKey []byte, limit int) (regions []*Region) {
 	now := time.Now().Unix()
 	lastStartKey := startKey
-	s.b.AscendGreaterOrEqual(newBtreeSearchItem(startKey), func(item *btreeItem) bool {
+	s.b.AscendGreaterOrEqual(newBtreeSearchItem(startKey), func(item btreeItem) bool {
 		region := item.cachedRegion
 		if len(endKey) > 0 && bytes.Compare(region.StartKey(), endKey) >= 0 {
 			return false
@@ -104,10 +104,10 @@ func (s *SortedRegions) AscendGreaterOrEqual(startKey, endKey []byte, limit int)
 
 // removeIntersecting removes all items that have intersection with the key range of given region.
 // If the region itself is in the cache, it's not removed.
-func (s *SortedRegions) removeIntersecting(r *Region, verID RegionVerID) ([]*btreeItem, bool) {
-	var deleted []*btreeItem
+func (s *SortedRegions) removeIntersecting(r *Region, verID RegionVerID) ([]btreeItem, bool) {
+	var deleted []btreeItem
 	var stale bool
-	s.b.AscendGreaterOrEqual(newBtreeSearchItem(r.StartKey()), func(item *btreeItem) bool {
+	s.b.AscendGreaterOrEqual(newBtreeSearchItem(r.StartKey()), func(item btreeItem) bool {
 		if len(r.EndKey()) > 0 && bytes.Compare(item.cachedRegion.StartKey(), r.EndKey()) >= 0 {
 			return false
 		}
@@ -137,7 +137,7 @@ func (s *SortedRegions) Clear() {
 
 // ValidRegionsInBtree returns the number of valid regions in the btree.
 func (s *SortedRegions) ValidRegionsInBtree(ts int64) (len int) {
-	s.b.Descend(func(item *btreeItem) bool {
+	s.b.Descend(func(item btreeItem) bool {
 		r := item.cachedRegion
 		if !r.checkRegionCacheTTL(ts) {
 			return true

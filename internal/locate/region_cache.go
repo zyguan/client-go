@@ -1242,7 +1242,7 @@ func WithNeedRegionHasLeaderPeer() BatchLocateKeyRangesOpt {
 }
 
 // BatchLocateKeyRanges lists regions in the given ranges.
-func (c *RegionCache) BatchLocateKeyRanges(bo *retry.Backoffer, keyRanges []kv.KeyRange, opts ...BatchLocateKeyRangesOpt) ([]*KeyLocation, error) {
+func (c *RegionCache) BatchLocateKeyRanges(bo *retry.Backoffer, keyRanges []kv.KeyRange, opts ...BatchLocateKeyRangesOpt) ([]KeyLocation, error) {
 	uncachedRanges := make([]pd.KeyRange, 0, len(keyRanges))
 	cachedRegions := make([]*Region, 0, len(keyRanges))
 	// 1. find regions from cache
@@ -1327,19 +1327,19 @@ type batchLocateRangesMerger struct {
 	lastEndKey      *[]byte
 	cachedIdx       int
 	cachedRegions   []*Region
-	mergedLocations []*KeyLocation
+	mergedLocations []KeyLocation
 }
 
 func newBatchLocateRegionMerger(cachedRegions []*Region, sizeHint int) *batchLocateRangesMerger {
 	return &batchLocateRangesMerger{
 		lastEndKey:      nil,
 		cachedRegions:   cachedRegions,
-		mergedLocations: make([]*KeyLocation, 0, sizeHint),
+		mergedLocations: make([]KeyLocation, 0, sizeHint),
 	}
 }
 
 func (m *batchLocateRangesMerger) appendKeyLocation(r *Region) {
-	m.mergedLocations = append(m.mergedLocations, &KeyLocation{
+	m.mergedLocations = append(m.mergedLocations, KeyLocation{
 		Region:   r.VerID(),
 		StartKey: r.StartKey(),
 		EndKey:   r.EndKey(),
@@ -1383,7 +1383,7 @@ func (m *batchLocateRangesMerger) appendRegion(uncachedRegion *Region) {
 	m.appendKeyLocation(uncachedRegion)
 }
 
-func (m *batchLocateRangesMerger) build() []*KeyLocation {
+func (m *batchLocateRangesMerger) build() []KeyLocation {
 	// append the rest cache hit regions
 	for ; m.cachedIdx < len(m.cachedRegions); m.cachedIdx++ {
 		if m.lastEndKey != nil && bytes.Compare(*m.lastEndKey, m.cachedRegions[m.cachedIdx].EndKey()) >= 0 {
@@ -2679,7 +2679,7 @@ func (c *RegionCache) gcRoundFunc(limit int) func(context.Context, time.Time) bo
 	}
 	beginning := newBtreeSearchItem([]byte(""))
 	cursor := beginning
-	expiredItems := make([]*btreeItem, limit)
+	expiredItems := make([]btreeItem, limit)
 	needCheckRegions := make([]*Region, limit)
 
 	return func(_ context.Context, t time.Time) bool {
@@ -2690,7 +2690,7 @@ func (c *RegionCache) gcRoundFunc(limit int) func(context.Context, time.Time) bo
 
 		// Only RLock when checking TTL to avoid blocking other readers
 		c.mu.RLock()
-		c.mu.sorted.b.AscendGreaterOrEqual(cursor, func(item *btreeItem) bool {
+		c.mu.sorted.b.AscendGreaterOrEqual(cursor, func(item btreeItem) bool {
 			count++
 			if count > limit {
 				cursor = item
@@ -2698,7 +2698,7 @@ func (c *RegionCache) gcRoundFunc(limit int) func(context.Context, time.Time) bo
 				return false
 			}
 			if onScanItem != nil {
-				(*onScanItem)(item)
+				(*onScanItem)(&item)
 			}
 			if item.cachedRegion.isCacheTTLExpired(ts) {
 				expiredItems = append(expiredItems, item)
@@ -2757,15 +2757,15 @@ type btreeItem struct {
 	cachedRegion *Region
 }
 
-func newBtreeItem(cr *Region) *btreeItem {
-	return &btreeItem{
+func newBtreeItem(cr *Region) btreeItem {
+	return btreeItem{
 		key:          cr.StartKey(),
 		cachedRegion: cr,
 	}
 }
 
-func newBtreeSearchItem(key []byte) *btreeItem {
-	return &btreeItem{
+func newBtreeSearchItem(key []byte) btreeItem {
+	return btreeItem{
 		key: key,
 	}
 }
