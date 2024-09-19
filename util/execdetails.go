@@ -95,7 +95,7 @@ func NewTiKVExecDetails(pb *kvrpcpb.ExecDetailsV2) TiKVExecDetails {
 		return TiKVExecDetails{}
 	}
 	td := &TimeDetail{}
-	td.MergeFromTimeDetail(pb.TimeDetailV2, pb.TimeDetail)
+	td.MergeFromTimeDetail(pb.TimeDetailV2)
 	sd := &ScanDetail{}
 	sd.MergeFromScanDetailV2(pb.ScanDetailV2)
 	wd := &WriteDetail{}
@@ -686,18 +686,13 @@ func (td *TimeDetail) Merge(detail *TimeDetail) {
 }
 
 // MergeFromTimeDetail merges time detail from pb into itself.
-func (td *TimeDetail) MergeFromTimeDetail(timeDetailV2 *kvrpcpb.TimeDetailV2, timeDetail *kvrpcpb.TimeDetail) {
+func (td *TimeDetail) MergeFromTimeDetail(timeDetailV2 *kvrpcpb.TimeDetailV2) {
 	if timeDetailV2 != nil {
 		td.WaitTime += time.Duration(timeDetailV2.WaitWallTimeNs) * time.Nanosecond
 		td.ProcessTime += time.Duration(timeDetailV2.ProcessWallTimeNs) * time.Nanosecond
 		td.SuspendTime += time.Duration(timeDetailV2.ProcessSuspendWallTimeNs) * time.Nanosecond
 		td.KvReadWallTime += time.Duration(timeDetailV2.KvReadWallTimeNs) * time.Nanosecond
 		td.TotalRPCWallTime += time.Duration(timeDetailV2.TotalRpcWallTimeNs) * time.Nanosecond
-	} else if timeDetail != nil {
-		td.WaitTime += time.Duration(timeDetail.WaitWallTimeMs) * time.Millisecond
-		td.ProcessTime += time.Duration(timeDetail.ProcessWallTimeMs) * time.Millisecond
-		td.KvReadWallTime += time.Duration(timeDetail.KvReadWallTimeMs) * time.Millisecond
-		td.TotalRPCWallTime += time.Duration(timeDetail.TotalRpcWallTimeNs) * time.Nanosecond
 	}
 }
 

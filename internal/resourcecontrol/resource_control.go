@@ -115,18 +115,15 @@ func MakeResponseInfo(resp *tikvrpc.Response) *ResponseInfo {
 	var (
 		readBytes uint64
 		detailsV2 *kvrpcpb.ExecDetailsV2
-		details   *kvrpcpb.ExecDetails
 	)
 	switch r := resp.Resp.(type) {
 	case *coprocessor.Response:
-		detailsV2 = r.GetExecDetailsV2()
-		details = r.GetExecDetails()
+		detailsV2 = r.ExecDetailsV2.Details()
 		readBytes = uint64(r.Data.Size())
 	case *tikvrpc.CopStreamResponse:
 		// Streaming request returns `io.EOF``, so the first `CopStreamResponse.Response`` may be nil.
 		if r.Response != nil {
-			detailsV2 = r.Response.GetExecDetailsV2()
-			details = r.Response.GetExecDetails()
+			detailsV2 = r.ExecDetailsV2.Details()
 		}
 		readBytes = uint64(r.Data.Size())
 	case *kvrpcpb.GetResponse:
@@ -145,20 +142,14 @@ func MakeResponseInfo(resp *tikvrpc.Response) *ResponseInfo {
 		readBytes = scanDetail.GetProcessedVersionsSize()
 	}
 	// Get the KV CPU time in milliseconds from the execution time details.
-	kvCPU := getKVCPU(detailsV2, details)
+	kvCPU := getKVCPU(detailsV2)
 	return &ResponseInfo{readBytes: readBytes, kvCPU: kvCPU}
 }
 
 // TODO: find out a more accurate way to get the actual KV CPU time.
-func getKVCPU(detailsV2 *kvrpcpb.ExecDetailsV2, details *kvrpcpb.ExecDetails) time.Duration {
+func getKVCPU(detailsV2 *kvrpcpb.ExecDetailsV2) time.Duration {
 	if timeDetail := detailsV2.GetTimeDetailV2(); timeDetail != nil {
 		return time.Duration(timeDetail.GetProcessWallTimeNs())
-	}
-	if timeDetail := detailsV2.GetTimeDetail(); timeDetail != nil {
-		return time.Duration(timeDetail.GetProcessWallTimeMs()) * time.Millisecond
-	}
-	if timeDetail := details.GetTimeDetail(); timeDetail != nil {
-		return time.Duration(timeDetail.GetProcessWallTimeMs()) * time.Millisecond
 	}
 	return time.Duration(0)
 }
