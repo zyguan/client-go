@@ -61,3 +61,5 @@ require (
 )
 
 replace github.com/tikv/pd/client => github.com/zyguan/pd/client v0.0.0-20240904061102-77b4024998c1
+
+replace github.com/pingcap/kvproto => github.com/zyguan/kvproto v0.0.0-20240924020900-ec5d6f9f5039

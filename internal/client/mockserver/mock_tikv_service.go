@@ -30,6 +30,7 @@ import (
 
 	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/pingcap/kvproto/pkg/sharedbytes"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
 	"github.com/tikv/client-go/v2/internal/logutil"
 	"go.uber.org/zap"
@@ -87,13 +88,18 @@ func (s *MockServer) BatchCommands(ss tikvpb.Tikv_BatchCommandsServer) error {
 			return err
 		}
 
-		responses := make([]*tikvpb.BatchCommandsResponse_Response, 0, len(req.GetRequestIds()))
+		responses := make([]sharedbytes.SharedBytes, 0, len(req.GetRequestIds()))
 		for i := 0; i < len(req.GetRequestIds()); i++ {
-			responses = append(responses, &tikvpb.BatchCommandsResponse_Response{
+			resp := tikvpb.BatchCommandsResponse_Response{
 				Cmd: &tikvpb.BatchCommandsResponse_Response_Empty{
 					Empty: &tikvpb.BatchCommandsEmptyResponse{},
 				},
-			})
+			}
+			data, err := resp.Marshal()
+			if err != nil {
+				return err
+			}
+			responses = append(responses, data)
 		}
 
 		err = ss.Send(&tikvpb.BatchCommandsResponse{

@@ -48,7 +48,7 @@ import (
 )
 
 func TestBatchResponse(t *testing.T) {
-	resp := &tikvpb.BatchCommandsResponse_Response{}
+	resp := tikvpb.BatchCommandsResponse_Response{}
 	batchResp, err := FromBatchCommandsResponse(resp)
 	assert.Nil(t, batchResp)
 	assert.NotNil(t, err)

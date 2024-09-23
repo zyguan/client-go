@@ -622,8 +622,6 @@ func (c *RPCClient) updateTiKVSendReqHistogram(req *tikvrpc.Request, resp *tikvr
 		var totalRpcWallTimeNs uint64
 		if execDetail.TimeDetailV2 != nil {
 			totalRpcWallTimeNs = execDetail.TimeDetailV2.TotalRpcWallTimeNs
-		} else if execDetail.TimeDetail != nil {
-			totalRpcWallTimeNs = execDetail.TimeDetail.TotalRpcWallTimeNs
 		}
 		if totalRpcWallTimeNs > 0 {
 			cacheKey := rpcNetLatencyCacheKey{
@@ -971,11 +969,10 @@ func buildSpanInfoFromResp(resp *tikvrpc.Response) *spanInfo {
 	}
 
 	td := details.TimeDetailV2
-	tdOld := details.TimeDetail
 	sd := details.ScanDetailV2
 	wd := details.WriteDetail
 
-	if td == nil && tdOld == nil {
+	if td == nil {
 		return nil
 	}
 
@@ -984,11 +981,6 @@ func buildSpanInfoFromResp(resp *tikvrpc.Response) *spanInfo {
 		spanRPC = spanInfo{name: "tikv.RPC", dur: td.TotalRpcWallTimeNs}
 		spanWait = spanInfo{name: "tikv.Wait", dur: td.WaitWallTimeNs}
 		spanProcess = spanInfo{name: "tikv.Process", dur: td.ProcessWallTimeNs}
-	} else if tdOld != nil {
-		// TimeDetail is deprecated, will be removed in future version.
-		spanRPC = spanInfo{name: "tikv.RPC", dur: tdOld.TotalRpcWallTimeNs}
-		spanWait = spanInfo{name: "tikv.Wait", dur: tdOld.WaitWallTimeMs * uint64(time.Millisecond)}
-		spanProcess = spanInfo{name: "tikv.Process", dur: tdOld.ProcessWallTimeMs * uint64(time.Millisecond)}
 	}
 
 	if sd != nil {

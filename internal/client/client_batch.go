@@ -67,7 +67,7 @@ import (
 type batchCommandsEntry struct {
 	ctx context.Context
 	req *tikvpb.BatchCommandsRequest_Request
-	res chan *tikvpb.BatchCommandsResponse_Response
+	res chan []byte
 	// forwardedHost is the address of a store which will handle the request.
 	// It's different from the address the request sent to.
 	forwardedHost string
@@ -953,7 +953,7 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 			c.onHealthFeedback(resp.GetHealthFeedback())
 		}
 
-		responses := resp.GetResponses()
+		responses := resp.Responses
 		for i, requestID := range resp.GetRequestIds() {
 			value, ok := c.batched.Load(requestID)
 			if !ok {
@@ -968,7 +968,6 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 			if trace.IsEnabled() {
 				trace.Log(entry.ctx, "rpc", "received")
 			}
-			logutil.Eventf(entry.ctx, "receive %T response with other %d batched requests from %s", responses[i].GetCmd(), len(responses), c.target)
 			if atomic.LoadInt32(&entry.canceled) == 0 {
 				// Put the response only if the request is not canceled.
 				entry.res <- responses[i]
@@ -1105,7 +1104,7 @@ func sendBatchRequest(
 	entry := &batchCommandsEntry{
 		ctx:           ctx,
 		req:           req,
-		res:           make(chan *tikvpb.BatchCommandsResponse_Response, 1),
+		res:           make(chan []byte, 1),
 		forwardedHost: forwardedHost,
 		canceled:      0,
 		err:           nil,
@@ -1142,7 +1141,14 @@ func sendBatchRequest(
 		if !ok {
 			return nil, errors.WithStack(entry.err)
 		}
-		return tikvrpc.FromBatchCommandsResponse(res)
+		if resp, ok := tikvpb.TryDecodeBatchCommandsResp(res); ok {
+			return &tikvrpc.Response{Resp: resp}, nil
+		}
+		var resp tikvpb.BatchCommandsResponse_Response
+		if err := resp.Unmarshal(res); err != nil {
+			return nil, errors.WithMessage(err, "decode response")
+		}
+		return tikvrpc.FromBatchCommandsResponse(resp)
 	case <-ctx.Done():
 		atomic.StoreInt32(&entry.canceled, 1)
 		logutil.Logger(ctx).Debug("wait response is cancelled",

@@ -475,7 +475,7 @@ func TestBatchCommandsBuilder(t *testing.T) {
 	builder.reset()
 	entries = entries[:0]
 	for i := 0; i < 3; i++ {
-		entry := &batchCommandsEntry{req: req, res: make(chan *tikvpb.BatchCommandsResponse_Response, 1)}
+		entry := &batchCommandsEntry{req: req, res: make(chan []byte, 1)}
 		entries = append(entries, entry)
 		builder.push(entry)
 	}
@@ -869,7 +869,7 @@ func TestBatchClientReceiveHealthFeedback(t *testing.T) {
 		resp, err := stream.Recv()
 		assert.NoError(t, err)
 		assert.Equal(t, []uint64{reqID}, resp.GetRequestIds())
-		assert.Len(t, resp.GetResponses(), 1)
+		assert.Len(t, resp.Responses, 1)
 		assert.Equal(t, uint64(1), resp.GetHealthFeedback().GetStoreId())
 		assert.Equal(t, reqID, resp.GetHealthFeedback().GetFeedbackSeqNo())
 		assert.Equal(t, int32(1), resp.GetHealthFeedback().GetSlowScore())
