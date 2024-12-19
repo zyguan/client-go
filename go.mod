@@ -3,6 +3,7 @@ module github.com/tikv/client-go/v2
 go 1.23
 
 require (
+	github.com/cloudwego/netpoll v0.6.5
 	github.com/cznic/mathutil v0.0.0-20181122101859-297441e03548
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da
 	github.com/docker/go-units v0.5.0
@@ -35,6 +36,7 @@ require (
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/bytedance/gopkg v0.1.0 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/cloudfoundry/gosigar v1.3.6 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect

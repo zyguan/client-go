@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"runtime/trace"
 	"strconv"
 	"strings"
@@ -47,6 +48,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cloudwego/netpoll"
 	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/kvproto/pkg/coprocessor"
@@ -74,6 +76,8 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 )
+
+const USE_NETPOLL = true
 
 // MaxRecvMsgSize set max gRPC receive message size received from server. If any message size is larger than
 // current value, an error will be reported from gRPC.
@@ -334,6 +338,11 @@ func (a *connArray) Init(addr string, security config.Security, idleNotify *uint
 		}, opts...)
 		if cfg.TiKVClient.GrpcSharedBufferPool {
 			opts = append(opts, experimental.WithRecvBufferPool(grpc.NewSharedBufferPool()))
+		}
+		if USE_NETPOLL {
+			opts = append(opts, grpc.WithContextDialer(func(ctx context.Context, s string) (net.Conn, error) {
+				return netpoll.DialConnection("tcp", s, a.dialTimeout)
+			}))
 		}
 		conn, err := a.monitoredDial(
 			ctx,
