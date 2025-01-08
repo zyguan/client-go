@@ -47,6 +47,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
 	"github.com/pkg/errors"
@@ -68,6 +69,7 @@ type batchCommandsEntry struct {
 	ctx context.Context
 	req *tikvpb.BatchCommandsRequest_Request
 	res chan *tikvpb.BatchCommandsResponse_Response
+	cb  tikvrpc.AsyncCallback
 	// forwardedHost is the address of a store which will handle the request.
 	// It's different from the address the request sent to.
 	forwardedHost string
@@ -90,9 +92,21 @@ func (b *batchCommandsEntry) priority() uint64 {
 	return b.pri
 }
 
+func (b *batchCommandsEntry) response(resp *tikvpb.BatchCommandsResponse_Response) {
+	if b.res != nil {
+		b.res <- resp
+	} else {
+		b.cb.Schedule(tikvrpc.FromBatchCommandsResponse(resp))
+	}
+}
+
 func (b *batchCommandsEntry) error(err error) {
 	b.err = err
-	close(b.res)
+	if b.res != nil {
+		close(b.res)
+	} else {
+		b.cb.Schedule(nil, err)
+	}
 }
 
 // batchCommandsBuilder collects a batch of `batchCommandsEntry`s to build
@@ -971,7 +985,7 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 			logutil.Eventf(entry.ctx, "receive %T response with other %d batched requests from %s", responses[i].GetCmd(), len(responses), c.target)
 			if atomic.LoadInt32(&entry.canceled) == 0 {
 				// Put the response only if the request is not canceled.
-				entry.res <- responses[i]
+				entry.response(responses[i])
 			}
 			c.batched.Delete(requestID)
 			c.sent.Add(-1)
@@ -1184,4 +1198,116 @@ func (c *RPCClient) recycleIdleConnArray() {
 	}
 
 	metrics.TiKVBatchClientRecycle.Observe(time.Since(start).Seconds())
+}
+
+func (c *RPCClient) SendRequestAsync(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration, cb tikvrpc.AsyncCallback) {
+	var (
+		err     error
+		spanRPC opentracing.Span
+	)
+	useCodec := c.option != nil && c.option.codec != nil
+	if useCodec {
+		req, err = c.option.codec.EncodeRequest(req)
+		if err != nil {
+			cb.Invoke(nil, err)
+			return
+		}
+	}
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		spanRPC = span.Tracer().StartSpan(fmt.Sprintf("rpcClient.SendRequest, region ID: %d, type: %s", req.RegionId, req.Type), opentracing.ChildOf(span.Context()))
+		ctx = opentracing.ContextWithSpan(ctx, spanRPC)
+	}
+
+	if atomic.CompareAndSwapUint32(&c.idleNotify, 1, 0) {
+		go c.recycleIdleConnArray()
+	}
+
+	if req.StoreTp != tikvrpc.TiKV {
+		cb.Invoke(nil, errors.New("unsupported store type"))
+		return
+	}
+	if config.GetGlobalConfig().TiKVClient.MaxBatchSize == 0 {
+		cb.Invoke(nil, errors.New("batch client is not enabled"))
+		return
+	}
+
+	batchReq := req.ToBatchCommandsRequest()
+	if batchReq == nil {
+		cb.Invoke(nil, errors.New("unsupported request type"))
+		return
+	}
+	connArray, err := c.getConnArray(addr, true)
+	if err != nil {
+		cb.Invoke(nil, err)
+		return
+	}
+
+	var (
+		timeoutTimer *time.Timer
+		stopCancelCb func() bool
+		entry        = &batchCommandsEntry{
+			ctx:           ctx,
+			req:           batchReq,
+			cb:            cb,
+			forwardedHost: req.ForwardedHost,
+			canceled:      0,
+			err:           nil,
+			pri:           req.GetResourceControlContext().GetOverridePriority(),
+			start:         time.Now(),
+		}
+	)
+	entry.cb.Inject(func(resp *tikvrpc.Response, err error) (*tikvrpc.Response, error) {
+		if timeoutTimer != nil {
+			timeoutTimer.Stop()
+		}
+		if stopCancelCb != nil {
+			stopCancelCb()
+		}
+
+		rpcDuration := time.Since(entry.start)
+
+		if sendLat := atomic.LoadInt64(&entry.sendLat); sendLat > 0 {
+			metrics.BatchRequestDurationSend.Observe(time.Duration(sendLat).Seconds())
+		}
+		if recvLat := atomic.LoadInt64(&entry.recvLat); recvLat > 0 {
+			metrics.BatchRequestDurationRecv.Observe(time.Duration(recvLat).Seconds())
+		}
+		metrics.BatchRequestDurationDone.Observe(rpcDuration.Seconds())
+
+		if stmtExec := ctx.Value(util.ExecDetailsKey); stmtExec != nil {
+			details := stmtExec.(*util.ExecDetails)
+			atomic.AddInt64(&details.WaitKVRespDuration, int64(rpcDuration))
+			execNetworkCollector := networkCollector{}
+			execNetworkCollector.onReq(req, details)
+			execNetworkCollector.onResp(req, resp, details)
+		}
+		c.updateSendReqHistogramAndExecStats(req, resp, entry.start)
+
+		if spanRPC != nil {
+			spanRPC.Finish()
+			if util.TraceExecDetailsEnabled(ctx) {
+				if si := buildSpanInfoFromResp(resp); si != nil {
+					si.addTo(spanRPC, entry.start)
+				}
+			}
+		}
+
+		if useCodec && err == nil {
+			resp, err = c.option.codec.DecodeResponse(req, resp)
+		}
+
+		return resp, WrapErrConn(err, connArray)
+	})
+
+	timeoutTimer = time.AfterFunc(timeout, func() {
+		entry.error(errors.WithMessage(context.DeadlineExceeded, "wait timeout"))
+	})
+	stopCancelCb = context.AfterFunc(ctx, func() {
+		entry.error(errors.WithStack(ctx.Err()))
+	})
+	// TODO(zyguan): should we call entry.error(errors.New("batchConn closed")) on batchConn closed? to do that, we need to:
+	// 1. iterate all entries in batchConn.reqBuilder and call entry.error.
+	// 2. iterate all entries in batchConn.batchCommandsClients.batched and call entry.error.
+
+	connArray.batchConn.batchCommandsCh <- entry
 }

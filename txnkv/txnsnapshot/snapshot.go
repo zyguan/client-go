@@ -62,6 +62,7 @@ import (
 	"github.com/tikv/client-go/v2/txnkv/txnlock"
 	"github.com/tikv/client-go/v2/txnkv/txnutil"
 	"github.com/tikv/client-go/v2/util"
+	"github.com/tikv/client-go/v2/util/runloop"
 	"go.uber.org/zap"
 )
 
@@ -255,7 +256,7 @@ func (s *KVSnapshot) BatchGetWithTier(ctx context.Context, keys [][]byte, readTi
 	s.mu.RUnlock()
 	// Create a map to collect key-values from region servers.
 	var mu sync.Mutex
-	err := s.batchGetKeysByRegions(bo, keys, readTier, func(k, v []byte) {
+	err := s.batchGetKeysByRegions(bo, keys, readTier, defaultBatchGetMethod, func(k, v []byte) {
 		// when read buffer tier, empty value means a delete record, should also collect it.
 		if len(v) == 0 && readTier != BatchGetBufferTier {
 			return
@@ -330,7 +331,7 @@ func growStackForBatchGetWorker() {
 	runtime.KeepAlive(ballast[:])
 }
 
-func (s *KVSnapshot) batchGetKeysByRegions(bo *retry.Backoffer, keys [][]byte, readTier int, collectF func(k, v []byte)) error {
+func (s *KVSnapshot) batchGetKeysByRegions(bo *retry.Backoffer, keys [][]byte, readTier int, method int, collectF func(k, v []byte)) error {
 	defer func(start time.Time) {
 		if s.IsInternal() {
 			metrics.TxnCmdHistogramWithBatchGetInternal.Observe(time.Since(start).Seconds())
@@ -360,15 +361,38 @@ func (s *KVSnapshot) batchGetKeysByRegions(bo *retry.Backoffer, keys [][]byte, r
 	if len(batches) == 1 {
 		return s.batchGetSingleRegion(bo, batches[0], readTier, collectF)
 	}
-	ch := make(chan error)
-	for _, batch1 := range batches {
-		batch := batch1
-		go func() {
-			growStackForBatchGetWorker()
-			backoffer, cancel := bo.Fork()
-			defer cancel()
-			ch <- s.batchGetSingleRegion(backoffer, batch, readTier, collectF)
-		}()
+	ch := make(chan error, len(batches))
+	if readTier == BatchGetSnapshotTier && method == batchGetAsync {
+		rl := runloop.New()
+		for _, batch1 := range batches {
+			batch := batch1
+			rl.Append(func() {
+				s.batchGetSingleRegionAsync(bo.Clone(), batch, readTier, collectF, rl, ch)
+			})
+		}
+		for {
+			_, err := rl.Exec(bo.GetCtx())
+			if err != nil {
+				return err
+			}
+			if len(ch) == len(batches) {
+				break
+			}
+		}
+	} else {
+		for _, batch1 := range batches {
+			batch := batch1
+			go func() {
+				growStackForBatchGetWorker()
+				backoffer, cancel := bo.Fork()
+				defer cancel()
+				if readTier == BatchGetSnapshotTier && method == batchGetLite {
+					ch <- s.batchGetSingleRegionLite(backoffer, batch, readTier, collectF)
+				} else {
+					ch <- s.batchGetSingleRegion(backoffer, batch, readTier, collectF)
+				}
+			}()
+		}
 	}
 	for i := 0; i < len(batches); i++ {
 		if e := <-ch; e != nil {
@@ -380,6 +404,14 @@ func (s *KVSnapshot) batchGetKeysByRegions(bo *retry.Backoffer, keys [][]byte, r
 	}
 	return err
 }
+
+const (
+	batchGetNormal = iota
+	batchGetLite
+	batchGetAsync
+
+	defaultBatchGetMethod = batchGetAsync
+)
 
 func (s *KVSnapshot) buildBatchGetRequest(keys [][]byte, busyThresholdMs int64, readTier int) (*tikvrpc.Request, error) {
 	ctx := kvrpcpb.Context{
@@ -498,7 +530,7 @@ func (s *KVSnapshot) batchGetSingleRegion(bo *retry.Backoffer, batch batchKeys, 
 			if same {
 				continue
 			}
-			return s.batchGetKeysByRegions(bo, pending, readTier, collectF)
+			return s.batchGetKeysByRegions(bo, pending, readTier, batchGetNormal, collectF)
 		}
 		if resp.Resp == nil {
 			return errors.WithStack(tikverr.ErrBodyMissing)
@@ -596,6 +628,222 @@ func (s *KVSnapshot) batchGetSingleRegion(bo *retry.Backoffer, batch batchKeys, 
 		}
 		return nil
 	}
+}
+
+func (s *KVSnapshot) batchGetSingleRegionLite(bo *retry.Backoffer, batch batchKeys, readTier int, collectF func(k, v []byte)) error {
+	cli := s.store.GetTiKVClient()
+	s.mu.RLock()
+	scope := s.mu.readReplicaScope
+	busyThresholdMs := s.mu.busyThreshold.Milliseconds()
+	req, err := s.buildBatchGetRequest(batch.keys, busyThresholdMs, readTier)
+	if err != nil {
+		s.mu.RUnlock()
+		return err
+	}
+	if s.mu.resourceGroupTag == nil && s.mu.resourceGroupTagger != nil {
+		s.mu.resourceGroupTagger(req)
+	}
+	s.mu.RUnlock()
+	req.TxnScope = scope
+	req.ReadReplicaScope = scope
+	timeout := client.ReadTimeoutMedium
+	if s.readTimeout > 0 {
+		timeout = s.readTimeout
+	}
+	req.MaxExecutionDurationMs = uint64(timeout.Milliseconds())
+	rpcCtx, err := s.store.GetRegionCache().GetTiKVRPCContext(bo, batch.region, kv.ReplicaReadLeader, 0)
+	if err != nil {
+		return err
+	}
+	if rpcCtx == nil {
+		s.store.GetRegionCache().InvalidateCachedRegion(batch.region)
+		return errors.WithStack(tikverr.ErrRegionUnavailable)
+	}
+	req.Context.ClusterId = rpcCtx.ClusterID
+	if err := tikvrpc.SetContext(req, rpcCtx.Meta, rpcCtx.Peer); err != nil {
+		return err
+	}
+	resp, err := cli.SendRequest(bo.GetCtx(), rpcCtx.Addr, req, timeout)
+	if err != nil {
+		return err
+	}
+	regionErr, err := resp.GetRegionError()
+	if err != nil {
+		return err
+	}
+	// handle region error
+	if regionErr != nil {
+		if regionErr.GetEpochNotMatch() == nil {
+			err = bo.Backoff(retry.BoRegionMiss, errors.New(regionErr.String()))
+			if err != nil {
+				return err
+			}
+		}
+		s.store.GetRegionCache().InvalidateCachedRegion(batch.region)
+		return errors.Errorf("meet region error: %s", regionErr)
+	}
+	if resp.Resp == nil {
+		return errors.WithStack(tikverr.ErrBodyMissing)
+	}
+	// handle locks
+	var (
+		keyLocked bool
+
+		keyErr *kvrpcpb.KeyError
+		pairs  []*kvrpcpb.KvPair
+	)
+	switch v := resp.Resp.(type) {
+	case *kvrpcpb.BatchGetResponse:
+		keyErr = v.GetError()
+		pairs = v.Pairs
+	case *kvrpcpb.BufferBatchGetResponse:
+		keyErr = v.GetError()
+		pairs = v.Pairs
+	default:
+		return errors.Errorf("unknown response %T", v)
+	}
+	if keyErr != nil {
+		_, err := txnlock.ExtractLockFromKeyErr(keyErr)
+		if err != nil {
+			return err
+		}
+		keyLocked = true
+	} else {
+		for _, pair := range pairs {
+			keyErr := pair.GetError()
+			if keyErr == nil {
+				collectF(pair.GetKey(), pair.GetValue())
+				continue
+			}
+			_, err := txnlock.ExtractLockFromKeyErr(keyErr)
+			if err != nil {
+				return err
+			}
+			keyLocked = true
+			break
+		}
+	}
+	if keyLocked {
+		return errors.New("some keys are locked")
+	}
+	return nil
+}
+
+func (s *KVSnapshot) batchGetSingleRegionAsync(bo *retry.Backoffer, batch batchKeys, readTier int, collectF func(k, v []byte), rl *runloop.RunLoop, ret chan<- error) {
+	cli, ok := s.store.GetTiKVClient().(client.ClientAsync)
+	if !ok {
+		ret <- errors.New("client does not support async send")
+		return
+	}
+	s.mu.RLock()
+	scope := s.mu.readReplicaScope
+	busyThresholdMs := s.mu.busyThreshold.Milliseconds()
+	req, err := s.buildBatchGetRequest(batch.keys, busyThresholdMs, readTier)
+	if err != nil {
+		s.mu.RUnlock()
+		ret <- err
+		return
+	}
+	if s.mu.resourceGroupTag == nil && s.mu.resourceGroupTagger != nil {
+		s.mu.resourceGroupTagger(req)
+	}
+	s.mu.RUnlock()
+	req.TxnScope = scope
+	req.ReadReplicaScope = scope
+	timeout := client.ReadTimeoutMedium
+	if s.readTimeout > 0 {
+		timeout = s.readTimeout
+	}
+	req.MaxExecutionDurationMs = uint64(timeout.Milliseconds())
+	rpcCtx, err := s.store.GetRegionCache().GetTiKVRPCContext(bo, batch.region, kv.ReplicaReadLeader, 0)
+	if err != nil {
+		ret <- err
+		return
+	}
+	if rpcCtx == nil {
+		s.store.GetRegionCache().InvalidateCachedRegion(batch.region)
+		ret <- errors.WithStack(tikverr.ErrRegionUnavailable)
+		return
+	}
+	req.Context.ClusterId = rpcCtx.ClusterID
+	if err := tikvrpc.SetContext(req, rpcCtx.Meta, rpcCtx.Peer); err != nil {
+		ret <- err
+		return
+	}
+	cli.SendRequestAsync(bo.GetCtx(), rpcCtx.Addr, req, timeout, tikvrpc.NewAsyncCallback(rl, func(resp *tikvrpc.Response, err error) {
+		if err != nil {
+			ret <- err
+			return
+		}
+		regionErr, err := resp.GetRegionError()
+		if err != nil {
+			ret <- err
+			return
+		}
+		// handle region error
+		if regionErr != nil {
+			if regionErr.GetEpochNotMatch() == nil {
+				err = bo.Backoff(retry.BoRegionMiss, errors.New(regionErr.String()))
+				if err != nil {
+					ret <- err
+					return
+				}
+			}
+			s.store.GetRegionCache().InvalidateCachedRegion(batch.region)
+			ret <- errors.Errorf("meet region error: %s", regionErr)
+			return
+		}
+		if resp.Resp == nil {
+			ret <- errors.WithStack(tikverr.ErrBodyMissing)
+			return
+		}
+		// handle locks
+		var (
+			keyLocked bool
+
+			keyErr *kvrpcpb.KeyError
+			pairs  []*kvrpcpb.KvPair
+		)
+		switch v := resp.Resp.(type) {
+		case *kvrpcpb.BatchGetResponse:
+			keyErr = v.GetError()
+			pairs = v.Pairs
+		case *kvrpcpb.BufferBatchGetResponse:
+			keyErr = v.GetError()
+			pairs = v.Pairs
+		default:
+			ret <- errors.Errorf("unknown response %T", v)
+			return
+		}
+		if keyErr != nil {
+			_, err := txnlock.ExtractLockFromKeyErr(keyErr)
+			if err != nil {
+				ret <- err
+				return
+			}
+			keyLocked = true
+		} else {
+			for _, pair := range pairs {
+				keyErr := pair.GetError()
+				if keyErr == nil {
+					collectF(pair.GetKey(), pair.GetValue())
+					continue
+				}
+				_, err := txnlock.ExtractLockFromKeyErr(keyErr)
+				if err != nil {
+					ret <- err
+					return
+				}
+				keyLocked = true
+				break
+			}
+		}
+		if keyLocked {
+			ret <- errors.New("some keys are locked")
+			return
+		}
+		ret <- nil
+	}))
 }
 
 const getMaxBackoff = 20000

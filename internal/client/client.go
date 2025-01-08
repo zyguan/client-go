@@ -122,6 +122,11 @@ type ClientExt interface {
 	CloseAddrVer(addr string, ver uint64) error
 }
 
+type ClientAsync interface {
+	// AsyncSendRequest sends Request asynchronously.
+	SendRequestAsync(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration, cb tikvrpc.AsyncCallback)
+}
+
 // ErrConn wraps error with target address and version of the connection.
 type ErrConn struct {
 	Err  error
@@ -570,10 +575,11 @@ type sendReqCounterCacheValue struct {
 	timeCounter prometheus.Counter
 }
 
-func (c *RPCClient) updateSendReqHistogramAndExecStats(req *tikvrpc.Request, resp *tikvrpc.Response, start time.Time, staleRead bool, execDetails *util.ExecDetails) {
+func (c *RPCClient) updateSendReqHistogramAndExecStats(req *tikvrpc.Request, resp *tikvrpc.Response, start time.Time) {
 	elapsed := time.Since(start)
 	secs := elapsed.Seconds()
 	storeID := req.Context.GetPeer().GetStoreId()
+	staleRead := req.Context.GetStaleRead()
 	isInternal := util.IsInternalRequest(req.GetRequestSource())
 
 	histKey := sendReqHistCacheKey{
@@ -641,13 +647,6 @@ func (c *RPCClient) updateSendReqHistogramAndExecStats(req *tikvrpc.Request, res
 			latHist.(prometheus.Observer).Observe(latency.Seconds())
 		}
 	}
-
-	execNetworkCollector := &networkCollector{}
-	// update execDetails
-	if execDetails != nil {
-		execNetworkCollector.onReq(req, execDetails)
-		execNetworkCollector.onResp(req, resp, execDetails)
-	}
 }
 
 func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (resp *tikvrpc.Response, err error) {
@@ -675,15 +674,15 @@ func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.R
 	}
 
 	start := time.Now()
-	staleRead := req.GetStaleRead()
 	defer func() {
-		stmtExec := ctx.Value(util.ExecDetailsKey)
-		var detail *util.ExecDetails
-		if stmtExec != nil {
-			detail = stmtExec.(*util.ExecDetails)
-			atomic.AddInt64(&detail.WaitKVRespDuration, int64(time.Since(start)))
+		if stmtExec := ctx.Value(util.ExecDetailsKey); stmtExec != nil {
+			details := stmtExec.(*util.ExecDetails)
+			atomic.AddInt64(&details.WaitKVRespDuration, int64(time.Since(start)))
+			execNetworkCollector := networkCollector{}
+			execNetworkCollector.onReq(req, details)
+			execNetworkCollector.onResp(req, resp, details)
 		}
-		c.updateSendReqHistogramAndExecStats(req, resp, start, staleRead, detail)
+		c.updateSendReqHistogramAndExecStats(req, resp, start)
 
 		if spanRPC != nil && util.TraceExecDetailsEnabled(ctx) {
 			if si := buildSpanInfoFromResp(resp); si != nil {

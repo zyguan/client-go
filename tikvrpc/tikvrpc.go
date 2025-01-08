@@ -36,6 +36,7 @@ package tikvrpc
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -49,6 +50,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/oracle"
+	"github.com/tikv/client-go/v2/util/runloop"
 )
 
 // CmdType represents the concrete request type in Request or response type in Response.
@@ -670,6 +672,49 @@ func (req *Request) ToBatchCommandsRequest() *tikvpb.BatchCommandsRequest_Reques
 // Response wraps all kv/coprocessor responses.
 type Response struct {
 	Resp interface{}
+}
+
+type AsyncReturn func(resp *Response, err error)
+
+type AsyncDefer func(resp *Response, err error) (*Response, error)
+
+type AsyncCallback interface {
+	Inject(g AsyncDefer)
+	Invoke(resp *Response, err error)
+	Schedule(resp *Response, err error)
+}
+
+func NewAsyncCallback(loop *runloop.RunLoop, f AsyncReturn) AsyncCallback {
+	return &runloopCallback{loop: loop, f: f, gs: make([]AsyncDefer, 0, 2)}
+}
+
+type runloopCallback struct {
+	once sync.Once
+	loop *runloop.RunLoop
+	f    AsyncReturn
+	gs   []AsyncDefer
+}
+
+// Inject implements AsyncCallback.
+func (cb *runloopCallback) Inject(g AsyncDefer) {
+	cb.gs = append(cb.gs, g)
+}
+
+// Invoke implements AsyncCallback.
+func (cb *runloopCallback) Invoke(resp *Response, err error) {
+	cb.once.Do(func() { cb.call(resp, err) })
+}
+
+// Schedule implements AsyncCallback.
+func (cb *runloopCallback) Schedule(resp *Response, err error) {
+	cb.once.Do(func() { cb.loop.Append(func() { cb.call(resp, err) }) })
+}
+
+func (cb *runloopCallback) call(resp *Response, err error) {
+	for i := len(cb.gs) - 1; i >= 0; i-- {
+		resp, err = cb.gs[i](resp, err)
+	}
+	cb.f(resp, err)
 }
 
 // FromBatchCommandsResponse converts a BatchCommands response to Response.
