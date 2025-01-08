@@ -122,6 +122,11 @@ type ClientExt interface {
 	CloseAddrVer(addr string, ver uint64) error
 }
 
+type ClientAsync interface {
+	// AsyncSendRequest sends Request asynchronously.
+	AsyncSendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration, cb tikvrpc.OnResponse)
+}
+
 // ErrConn wraps error with target address and version of the connection.
 type ErrConn struct {
 	Err  error
@@ -674,23 +679,24 @@ func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.R
 		return resp, WrapErrConn(err, connArray)
 	}
 
-	start := time.Now()
-	staleRead := req.GetStaleRead()
-	defer func() {
-		stmtExec := ctx.Value(util.ExecDetailsKey)
-		var detail *util.ExecDetails
-		if stmtExec != nil {
-			detail = stmtExec.(*util.ExecDetails)
-			atomic.AddInt64(&detail.WaitKVRespDuration, int64(time.Since(start)))
-		}
-		c.updateSendReqHistogramAndExecStats(req, resp, start, staleRead, detail)
+	// TODO(zyguan): temporarily skip recording metrics for comparing performance.
+	// start := time.Now()
+	// staleRead := req.GetStaleRead()
+	// defer func() {
+	// 	stmtExec := ctx.Value(util.ExecDetailsKey)
+	// 	var detail *util.ExecDetails
+	// 	if stmtExec != nil {
+	// 		detail = stmtExec.(*util.ExecDetails)
+	// 		atomic.AddInt64(&detail.WaitKVRespDuration, int64(time.Since(start)))
+	// 	}
+	// 	c.updateSendReqHistogramAndExecStats(req, resp, start, staleRead, detail)
 
-		if spanRPC != nil && util.TraceExecDetailsEnabled(ctx) {
-			if si := buildSpanInfoFromResp(resp); si != nil {
-				si.addTo(spanRPC, start)
-			}
-		}
-	}()
+	// 	if spanRPC != nil && util.TraceExecDetailsEnabled(ctx) {
+	// 		if si := buildSpanInfoFromResp(resp); si != nil {
+	// 			si.addTo(spanRPC, start)
+	// 		}
+	// 	}
+	// }()
 
 	// TiDB RPC server supports batch RPC, but batch connection will send heart beat, It's not necessary since
 	// request to TiDB is not high frequency.

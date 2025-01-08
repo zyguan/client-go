@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/tikv/client-go/v2/internal/resourcecontrol"
 	"github.com/tikv/client-go/v2/tikvrpc"
 	"github.com/tikv/client-go/v2/tikvrpc/interceptor"
@@ -58,6 +59,16 @@ func (r interceptedClient) SendRequest(ctx context.Context, addr string, req *ti
 		})(addr, req)
 	}
 	return r.Client.SendRequest(ctx, addr, req, timeout)
+}
+
+func (r interceptedClient) AsyncSendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration, cb tikvrpc.OnResponse) {
+	cli, ok := r.Client.(ClientAsync)
+	if !ok {
+		cb(nil, errors.Errorf("client %T doesn't support async send request", r.Client))
+		return
+	}
+	// TODO(zyguan): resource control
+	cli.AsyncSendRequest(ctx, addr, req, timeout, cb)
 }
 
 var (

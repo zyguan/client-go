@@ -74,6 +74,18 @@ func (r reqCollapse) SendRequest(ctx context.Context, addr string, req *tikvrpc.
 	return r.Client.SendRequest(ctx, addr, req, timeout)
 }
 
+func (r reqCollapse) AsyncSendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration, cb tikvrpc.OnResponse) {
+	if r.Client == nil {
+		panic("client should not be nil")
+	}
+	cli, ok := r.Client.(ClientAsync)
+	if !ok {
+		cb(nil, errors.Errorf("client %T doesn't support async send request", r.Client))
+		return
+	}
+	cli.AsyncSendRequest(ctx, addr, req, timeout, cb)
+}
+
 func (r reqCollapse) tryCollapseRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (canCollapse bool, resp *tikvrpc.Response, err error) {
 	switch req.Type {
 	case tikvrpc.CmdResolveLock:

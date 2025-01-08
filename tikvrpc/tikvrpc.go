@@ -672,6 +672,8 @@ type Response struct {
 	Resp interface{}
 }
 
+type OnResponse func(resp *Response, err error)
+
 // FromBatchCommandsResponse converts a BatchCommands response to Response.
 func FromBatchCommandsResponse(res *tikvpb.BatchCommandsResponse_Response) (*Response, error) {
 	if res.GetCmd() == nil {

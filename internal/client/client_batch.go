@@ -68,6 +68,7 @@ type batchCommandsEntry struct {
 	ctx context.Context
 	req *tikvpb.BatchCommandsRequest_Request
 	res chan *tikvpb.BatchCommandsResponse_Response
+	cb  tikvrpc.OnResponse
 	// forwardedHost is the address of a store which will handle the request.
 	// It's different from the address the request sent to.
 	forwardedHost string
@@ -92,7 +93,11 @@ func (b *batchCommandsEntry) priority() uint64 {
 
 func (b *batchCommandsEntry) error(err error) {
 	b.err = err
-	close(b.res)
+	if b.res != nil {
+		close(b.res)
+	} else {
+		b.cb(nil, err)
+	}
 }
 
 // batchCommandsBuilder collects a batch of `batchCommandsEntry`s to build
@@ -971,7 +976,11 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 			logutil.Eventf(entry.ctx, "receive %T response with other %d batched requests from %s", responses[i].GetCmd(), len(responses), c.target)
 			if atomic.LoadInt32(&entry.canceled) == 0 {
 				// Put the response only if the request is not canceled.
-				entry.res <- responses[i]
+				if entry.res != nil {
+					entry.res <- responses[i]
+				} else {
+					entry.cb(tikvrpc.FromBatchCommandsResponse(responses[i]))
+				}
 			}
 			c.batched.Delete(requestID)
 			c.sent.Add(-1)
@@ -1113,16 +1122,18 @@ func sendBatchRequest(
 		start:         time.Now(),
 	}
 	timer := time.NewTimer(timeout)
-	defer func() {
-		timer.Stop()
-		if sendLat := atomic.LoadInt64(&entry.sendLat); sendLat > 0 {
-			metrics.BatchRequestDurationSend.Observe(time.Duration(sendLat).Seconds())
-		}
-		if recvLat := atomic.LoadInt64(&entry.recvLat); recvLat > 0 {
-			metrics.BatchRequestDurationRecv.Observe(time.Duration(recvLat).Seconds())
-		}
-		metrics.BatchRequestDurationDone.Observe(time.Since(entry.start).Seconds())
-	}()
+	defer timer.Stop()
+	// TODO(zyguan): temporarily skip recording metrics for comparing performance.
+	// defer func() {
+	// 	timer.Stop()
+	// 	if sendLat := atomic.LoadInt64(&entry.sendLat); sendLat > 0 {
+	// 		metrics.BatchRequestDurationSend.Observe(time.Duration(sendLat).Seconds())
+	// 	}
+	// 	if recvLat := atomic.LoadInt64(&entry.recvLat); recvLat > 0 {
+	// 		metrics.BatchRequestDurationRecv.Observe(time.Duration(recvLat).Seconds())
+	// 	}
+	// 	metrics.BatchRequestDurationDone.Observe(time.Since(entry.start).Seconds())
+	// }()
 
 	select {
 	case batchConn.batchCommandsCh <- entry:
@@ -1184,4 +1195,68 @@ func (c *RPCClient) recycleIdleConnArray() {
 	}
 
 	metrics.TiKVBatchClientRecycle.Observe(time.Since(start).Seconds())
+}
+
+func (c *RPCClient) AsyncSendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration, cb tikvrpc.OnResponse) {
+	// TODO(zyguan): tracing, metrics, etc.
+
+	if atomic.CompareAndSwapUint32(&c.idleNotify, 1, 0) {
+		go c.recycleIdleConnArray()
+	}
+
+	if req.StoreTp != tikvrpc.TiKV {
+		cb(nil, errors.New("unsupported store type"))
+		return
+	}
+	if config.GetGlobalConfig().TiKVClient.MaxBatchSize == 0 {
+		cb(nil, errors.New("batch client is not enabled"))
+		return
+	}
+
+	batchReq := req.ToBatchCommandsRequest()
+	if batchReq == nil {
+		cb(nil, errors.New("unsupported request type"))
+		return
+	}
+	connArray, err := c.getConnArray(addr, true)
+	if err != nil {
+		cb(nil, err)
+		return
+	}
+	batchConn := connArray.batchConn
+
+	var (
+		once  sync.Once
+		entry = &batchCommandsEntry{
+			ctx:           ctx,
+			req:           batchReq,
+			forwardedHost: req.ForwardedHost,
+			canceled:      0,
+			err:           nil,
+			pri:           req.GetResourceControlContext().GetOverridePriority(),
+			start:         time.Now(),
+		}
+	)
+
+	// TODO(zyguan): cb(nil, err) on: timeout, ctx canceled, batchConn closed
+	// timeoutTimer := time.AfterFunc(timeout, func() {
+	// 	once.Do(func() {
+	// 		atomic.StoreInt32(&entry.canceled, 1)
+	// 		cb(nil, errors.WithMessage(context.DeadlineExceeded, "wait timeout"))
+	// 	})
+	// })
+	// cancelCtxDoneCb := context.AfterFunc(ctx, func() {
+	// 	once.Do(func() {
+	// 		atomic.StoreInt32(&entry.canceled, 1)
+	// 		cb(nil, errors.WithStack(ctx.Err()))
+	// 	})
+	// })
+
+	entry.cb = func(resp *tikvrpc.Response, err error) {
+		once.Do(func() {
+			cb(resp, err)
+		})
+	}
+
+	batchConn.batchCommandsCh <- entry
 }
