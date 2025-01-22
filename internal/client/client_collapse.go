@@ -37,11 +37,13 @@ package client
 
 import (
 	"context"
+	"reflect"
 	"strconv"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/tikv/client-go/v2/tikvrpc"
+	"github.com/tikv/client-go/v2/util/co"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -72,6 +74,51 @@ func (r reqCollapse) SendRequest(ctx context.Context, addr string, req *tikvrpc.
 		return resp, err
 	}
 	return r.Client.SendRequest(ctx, addr, req, timeout)
+}
+
+func (r reqCollapse) AsyncSendRequest(ctx context.Context, addr string, req *tikvrpc.Request) co.Coroutine[co.Result[*tikvrpc.Response]] {
+	if r.Client == nil {
+		panic("client should not be nil")
+	}
+	cli, ok := r.Client.(AsyncClient)
+	if !ok {
+		panic("client should implement AsyncClient interface")
+	}
+	return func(yield func(co.Result[*tikvrpc.Response], *co.Pending) bool) {
+		if req.Type == tikvrpc.CmdResolveLock && len(req.ResolveLock().Keys) == 0 && len(req.ResolveLock().TxnInfos) == 0 {
+			// try collapse resolve lock request.
+			key := strconv.FormatUint(req.Context.RegionId, 10) + "-" + strconv.FormatUint(req.ResolveLock().StartVersion, 10)
+			copyReq := *req
+			rsC := resolveRegionSf.DoChan(key, func() (interface{}, error) {
+				// singleflight group will call this function in a goroutine, thus use SendRequest instead of AsyncSendRequest.
+				return r.Client.SendRequest(context.Background(), addr, &copyReq, ReadTimeoutShort)
+			})
+			pending := &co.Pending{
+				Cases: []reflect.SelectCase{
+					{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(rsC)},
+					{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())},
+				},
+			}
+			if !yield(co.Result[*tikvrpc.Response]{}, pending) {
+				return
+			}
+			switch pending.Chosen {
+			case 0:
+				rs := pending.Recv.Interface().(singleflight.Result)
+				if rs.Err != nil {
+					yield(co.Result[*tikvrpc.Response]{Err: errors.WithStack(rs.Err)}, nil)
+				} else {
+					yield(co.Result[*tikvrpc.Response]{Val: rs.Val.(*tikvrpc.Response)}, nil)
+				}
+			case 1:
+				yield(co.Result[*tikvrpc.Response]{Err: errors.WithStack(ctx.Err())}, nil)
+			default:
+				yield(co.Result[*tikvrpc.Response]{Err: errors.New("unreachable")}, nil)
+			}
+		} else {
+			co.Return(cli.AsyncSendRequest(ctx, addr, req), yield)
+		}
+	}
 }
 
 func (r reqCollapse) tryCollapseRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (canCollapse bool, resp *tikvrpc.Response, err error) {

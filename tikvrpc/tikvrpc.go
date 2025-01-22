@@ -47,6 +47,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/mpp"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
 	"github.com/pkg/errors"
+	"github.com/tikv/client-go/v2/config"
 	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/oracle"
 )
@@ -594,6 +595,25 @@ func (req *Request) Flush() *kvrpcpb.FlushRequest {
 // BufferBatchGet returns BufferBatchGetRequest in request.
 func (req *Request) BufferBatchGet() *kvrpcpb.BufferBatchGetRequest {
 	return req.Req.(*kvrpcpb.BufferBatchGetRequest)
+}
+
+// CanBeBatched checks whether the request can be batched.
+func (req *Request) CanBeBatched() (yes bool, reason string) {
+	if config.GetGlobalConfig().TiKVClient.MaxBatchSize == 0 {
+		return false, "batch client is disabled"
+	}
+	if req.StoreTp != TiKV {
+		return false, "unsupported store type: " + req.StoreTp.Name()
+	}
+	switch req.Type {
+	case CmdGet, CmdScan, CmdPrewrite, CmdCommit, CmdCleanup, CmdBatchGet, CmdBatchRollback,
+		CmdScanLock, CmdResolveLock, CmdGC, CmdDeleteRange, CmdPessimisticLock, CmdPessimisticRollback,
+		CmdTxnHeartBeat, CmdCheckTxnStatus, CmdCheckSecondaryLocks, CmdFlush, CmdBufferBatchGet,
+		CmdFlashbackToVersion, CmdPrepareFlashbackToVersion:
+		return true, ""
+	default:
+		return false, "unsupported request type: " + req.Type.String()
+	}
 }
 
 // ToBatchCommandsRequest converts the request to an entry in BatchCommands request.

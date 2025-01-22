@@ -1,6 +1,6 @@
 module github.com/tikv/client-go/v2
 
-go 1.23
+go 1.24rc2
 
 require (
 	github.com/VividCortex/ewma v1.2.0

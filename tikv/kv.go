@@ -289,7 +289,8 @@ func NewKVStore(uuid string, pdClient pd.Client, spkv SafePointKV, tikvclient Cl
 		cancel:          cancel,
 		gP:              NewSpool(128, 10*time.Second),
 	}
-	store.clientMu.client = client.NewReqCollapse(client.NewInterceptedClient(tikvclient))
+	// DEMO(zyguan): omit InterceptedClient for AsyncClient PoC
+	store.clientMu.client = client.NewReqCollapse(tikvclient)
 	store.clientMu.client.SetEventListener(regionCache.GetClientEventListener())
 
 	store.lockResolver = txnlock.NewLockResolver(store)
