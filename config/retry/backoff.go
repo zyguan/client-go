@@ -192,7 +192,7 @@ func (b *Backoffer) BackoffWithCfgAndMaxSleep(cfg *Config, maxSleepMs int, err e
 		f = cfg.createBackoffFn(b.vars)
 		b.fn[cfg.name] = f
 	}
-	realSleep := f(b.ctx, maxSleepMs)
+	realSleep := f(b.ctx, maxSleepMs, nil)
 	if cfg.metric != nil {
 		(*cfg.metric).Observe(float64(realSleep) / 1000)
 	}

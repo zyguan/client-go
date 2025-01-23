@@ -47,6 +47,7 @@ import (
 	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/metrics"
 	"github.com/tikv/client-go/v2/util"
+	"github.com/tikv/client-go/v2/util/async"
 	"go.uber.org/zap"
 )
 
@@ -59,7 +60,8 @@ type Config struct {
 }
 
 // backoffFn is the backoff function which compute the sleep time and do sleep.
-type backoffFn func(ctx context.Context, maxSleepMs int) int
+// When `cb` is not nil, backoffFn will return immediately and call `cb` after sleep.
+type backoffFn func(ctx context.Context, maxSleepMs int, cb async.Callback[int]) int
 
 func (c *Config) createBackoffFn(vars *kv.Variables) backoffFn {
 	if strings.EqualFold(c.name, txnLockFastName) {
@@ -172,7 +174,7 @@ func newBackoffFn(base, cap, jitter int) backoffFn {
 	}
 	attempts := 0
 	lastSleep := base
-	return func(ctx context.Context, maxSleepMs int) int {
+	return func(ctx context.Context, maxSleepMs int, cb async.Callback[int]) int {
 		var sleep int
 		switch jitter {
 		case NoJitter:
@@ -196,6 +198,35 @@ func newBackoffFn(base, cap, jitter int) backoffFn {
 		if maxSleepMs >= 0 && realSleep > maxSleepMs {
 			realSleep = maxSleepMs
 		}
+
+		// async backoff wait
+		if cb != nil {
+			var (
+				timer *time.Timer
+				stop  func() bool
+			)
+			cb.Inject(func(realSleepMs int, err error) (int, error) {
+				if realSleepMs > 0 {
+					attempts++
+					lastSleep = sleep
+				}
+				return realSleepMs, err
+			})
+			timer = time.AfterFunc(time.Duration(realSleep)*time.Millisecond, func() {
+				if stop != nil {
+					stop()
+				}
+				cb.Schedule(realSleep, nil)
+			})
+			stop = context.AfterFunc(ctx, func() {
+				if timer != nil {
+					timer.Stop()
+				}
+				cb.Schedule(0, nil)
+			})
+			return 0
+		}
+
 		if _, err := util.EvalFailpoint("fastBackoffBySkipSleep"); err == nil {
 			attempts++
 			lastSleep = sleep

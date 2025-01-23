@@ -62,6 +62,7 @@ import (
 	"github.com/tikv/client-go/v2/txnkv/txnlock"
 	"github.com/tikv/client-go/v2/txnkv/txnutil"
 	"github.com/tikv/client-go/v2/util"
+	"github.com/tikv/client-go/v2/util/async"
 	"go.uber.org/zap"
 )
 
@@ -255,7 +256,7 @@ func (s *KVSnapshot) BatchGetWithTier(ctx context.Context, keys [][]byte, readTi
 	s.mu.RUnlock()
 	// Create a map to collect key-values from region servers.
 	var mu sync.Mutex
-	err := s.batchGetKeysByRegions(bo, keys, readTier, func(k, v []byte) {
+	err := s.batchGetKeysByRegions(bo, keys, readTier, defaultBatchGetMethod, func(k, v []byte) {
 		// when read buffer tier, empty value means a delete record, should also collect it.
 		if len(v) == 0 && readTier != BatchGetBufferTier {
 			return
@@ -330,7 +331,7 @@ func growStackForBatchGetWorker() {
 	runtime.KeepAlive(ballast[:])
 }
 
-func (s *KVSnapshot) batchGetKeysByRegions(bo *retry.Backoffer, keys [][]byte, readTier int, collectF func(k, v []byte)) error {
+func (s *KVSnapshot) batchGetKeysByRegions(bo *retry.Backoffer, keys [][]byte, readTier int, method int, collectF func(k, v []byte)) error {
 	defer func(start time.Time) {
 		if s.IsInternal() {
 			metrics.TxnCmdHistogramWithBatchGetInternal.Observe(time.Since(start).Seconds())
@@ -363,18 +364,47 @@ func (s *KVSnapshot) batchGetKeysByRegions(bo *retry.Backoffer, keys [][]byte, r
 	ch := make(chan error, len(batches))
 	bo, cancel := bo.Fork()
 	defer cancel()
-	for i, batch1 := range batches {
-		var backoffer *retry.Backoffer
-		if i == 0 {
-			backoffer = bo
-		} else {
-			backoffer = bo.Clone()
+	if readTier == BatchGetSnapshotTier && method == batchGetAsync {
+		rl := async.NewRunLoop()
+		for i, batch1 := range batches {
+			var backoffer *retry.Backoffer
+			if i == 0 {
+				backoffer = bo
+			} else {
+				backoffer = bo.Clone()
+			}
+			batch := batch1
+			rl.Append(func() {
+				s.batchGetSingleRegionAsync(backoffer, batch, readTier, collectF, rl, ch)
+			})
 		}
-		batch := batch1
-		go func() {
-			growStackForBatchGetWorker()
-			ch <- s.batchGetSingleRegion(backoffer, batch, readTier, collectF)
-		}()
+		for {
+			_, err := rl.Exec(bo.GetCtx())
+			if err != nil {
+				return err
+			}
+			if len(ch) == len(batches) {
+				break
+			}
+		}
+	} else {
+		for i, batch1 := range batches {
+			var backoffer *retry.Backoffer
+			if i == 0 {
+				backoffer = bo
+			} else {
+				backoffer = bo.Clone()
+			}
+			batch := batch1
+			go func() {
+				growStackForBatchGetWorker()
+				if readTier == BatchGetSnapshotTier && method == batchGetLite {
+					ch <- s.batchGetSingleRegionLite(backoffer, batch, readTier, collectF)
+				} else {
+					ch <- s.batchGetSingleRegion(backoffer, batch, readTier, collectF)
+				}
+			}()
+		}
 	}
 	for i := 0; i < len(batches); i++ {
 		if e := <-ch; e != nil {
@@ -505,7 +535,7 @@ func (s *KVSnapshot) batchGetSingleRegion(bo *retry.Backoffer, batch batchKeys, 
 			if same {
 				continue
 			}
-			return s.batchGetKeysByRegions(bo, pending, readTier, collectF)
+			return s.batchGetKeysByRegions(bo, pending, readTier, batchGetBase, collectF)
 		}
 		if resp.Resp == nil {
 			return errors.WithStack(tikverr.ErrBodyMissing)
