@@ -65,6 +65,7 @@ import (
 	"github.com/tikv/client-go/v2/metrics"
 	"github.com/tikv/client-go/v2/tikvrpc"
 	"github.com/tikv/client-go/v2/util"
+	"github.com/tikv/client-go/v2/util/dedicated"
 	"github.com/tikv/client-go/v2/util/redact"
 	pd "github.com/tikv/pd/client"
 	"github.com/tikv/pd/client/clients/router"
@@ -732,7 +733,7 @@ func NewRegionCache(pdClient pd.Client, opt ...RegionCacheOpt) *RegionCache {
 		needCheckStores = c.checkAndResolve(needCheckStores[:0], func(s *Store) bool { return filter(s.getResolveState()) })
 		return false
 	}, time.Duration(refreshStoreInterval/4)*time.Second, c.stores.getCheckStoreEvents())
-	if !options.noHealthTick {
+	if !dedicated.Enabled && !options.noHealthTick {
 		c.bg.schedule(c.checkAndUpdateStoreHealthStatus, time.Duration(refreshStoreInterval/4)*time.Second)
 	}
 	c.bg.schedule(repeat(c.reportStoreReplicaFlows), time.Duration(refreshStoreInterval/2)*time.Second)
