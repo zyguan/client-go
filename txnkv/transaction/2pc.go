@@ -1547,13 +1547,29 @@ func (c *twoPhaseCommitter) checkAsyncCommit() bool {
 
 // checkOnePC checks if 1PC protocol is available for current transaction.
 func (c *twoPhaseCommitter) checkOnePC() bool {
+	isLossyDDLTxn := c.isLossyDDLReorg()
 	// Disable 1PC in local transactions
 	if c.txn.GetScope() != oracle.GlobalTxnScope {
+		if isLossyDDLTxn {
+			logutil.BgLogger().Info(">>> lossy ddl reorg txn cannot use 1pc due to txn scope", zap.String("TxnScope", c.txn.GetScope()))
+		}
 		return false
 	}
 	// Disable 1PC for transaction when commitTSUpperBoundCheck is set.
 	if c.txn.commitTSUpperBoundCheck != nil {
+		if isLossyDDLTxn {
+			logutil.BgLogger().Info(">>> lossy ddl reorg txn cannot use 1pc do to commit-ts checker")
+		}
 		return false
+	}
+
+	if isLossyDDLTxn {
+		if c.shouldWriteBinlog() {
+			logutil.BgLogger().Info(">>> lossy ddl reorg txn cannot use 1pc due to binlog")
+		}
+		if !c.txn.enable1PC {
+			logutil.BgLogger().Info(">>> lossy ddl reorg txn cannot use 1pc due to it is disabled")
+		}
 	}
 
 	return !c.shouldWriteBinlog() && c.txn.enable1PC
@@ -1590,6 +1606,9 @@ func (c *twoPhaseCommitter) setOnePC(val bool) {
 func (c *twoPhaseCommitter) checkOnePCFallBack(action twoPhaseCommitAction, batchCount int) {
 	if _, ok := action.(actionPrewrite); ok {
 		if batchCount > 1 {
+			if c.isLossyDDLReorg() {
+				logutil.BgLogger().Info(">>> lossy ddl reorg txn cannot use 1pc due to multiple regions", zap.Int("count", batchCount))
+			}
 			c.setOnePC(false)
 		}
 	}
@@ -1665,6 +1684,10 @@ func (c *twoPhaseCommitter) cleanup(ctx context.Context) {
 	})
 }
 
+func (c *twoPhaseCommitter) isLossyDDLReorg() bool {
+	return (c.txn.txnSource >> 8) != 0
+}
+
 // execute executes the two-phase commit protocol.
 func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 	c.minCommitTSMgr.elevateWriteAccess(twoPCAccess)
@@ -1680,6 +1703,9 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 			} else {
 				metrics.OnePCTxnCounterOk.Inc()
 			}
+			if c.isLossyDDLReorg() {
+				logutil.Logger(ctx).Info(">>> lossy ddl reorg txn using 1pc")
+			}
 		} else if c.isAsyncCommit() {
 			// The error means the async commit should not succeed.
 			if err != nil {
@@ -1689,6 +1715,9 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 				metrics.AsyncCommitTxnCounterError.Inc()
 			} else {
 				metrics.AsyncCommitTxnCounterOk.Inc()
+			}
+			if c.isLossyDDLReorg() {
+				logutil.Logger(ctx).Info(">>> lossy ddl reorg txn using async commit")
 			}
 		} else {
 			// Always clean up all written keys if the txn does not commit.
@@ -1701,6 +1730,9 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 				metrics.TwoPCTxnCounterError.Inc()
 			} else {
 				metrics.TwoPCTxnCounterOk.Inc()
+			}
+			if c.isLossyDDLReorg() {
+				logutil.Logger(ctx).Info(">>> lossy ddl reorg txn using 2pc")
 			}
 			c.txn.commitTS = c.commitTS
 			if binlogSkipped {
