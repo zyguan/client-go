@@ -902,7 +902,8 @@ func (txn *KVTxn) collectLockedKeys() [][]byte {
 	var err error
 	for it := buf.IterWithFlags(nil, nil); it.Valid(); err = it.Next() {
 		_ = err
-		if it.Flags().HasLocked() {
+		flags := it.Flags()
+		if flags.HasLocked() || flags.HasLockedInShareMode() {
 			keys = append(keys, it.Key())
 		}
 	}
