@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/suite"
 	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/oracle"
-	"github.com/tikv/client-go/v2/testutils"
 	"github.com/tikv/client-go/v2/tikv"
 	"github.com/tikv/client-go/v2/txnkv/transaction"
 	"github.com/tikv/client-go/v2/txnkv/txnlock"
@@ -23,8 +22,7 @@ func TestSharedLock(t *testing.T) {
 
 type testSharedLockSuite struct {
 	suite.Suite
-	cluster testutils.Cluster
-	store   tikv.StoreProbe
+	store tikv.StoreProbe
 }
 
 func (s *testSharedLockSuite) SetupSuite() {
@@ -39,17 +37,7 @@ func (s *testSharedLockSuite) TearDownSuite() {
 }
 
 func (s *testSharedLockSuite) SetupTest() {
-	s.store = tikv.StoreProbe{NewTestStore(s.T())}
-	// client, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
-	// s.Require().Nil(err)
-	// testutils.BootstrapWithMultiRegions(cluster, []byte("a"), []byte("b"), []byte("c"))
-	// s.cluster = cluster
-	// pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
-	// spkv := tikv.NewMockSafePointKV()
-	// store, err := tikv.NewKVStore("mocktikv-store", pdCli, spkv, client)
-	// store.EnableTxnLocalLatches(8096)
-	// s.Require().Nil(err)
-	// s.store = tikv.StoreProbe{KVStore: store}
+	s.store = tikv.StoreProbe{KVStore: NewTestStore(s.T())}
 }
 
 func (s *testSharedLockSuite) TearDownTest() {
@@ -84,9 +72,9 @@ func (s *testSharedLockSuite) TestSharedLockBlockExclusiveLock() {
 		txn2 := s.begin()
 		txn3 := s.begin()
 
-		pk1 := []byte("shared_lock_pk1")
-		pk2 := []byte("shared_lock_pk2")
-		pk3 := []byte("shared_lock_pk3")
+		pk1 := []byte("pk1")
+		pk2 := []byte("pk2")
+		pk3 := []byte("pk3")
 		key := []byte("shared_lock_key")
 
 		s.Nil(txn1.LockKeys(context.Background(), kv.NewLockCtx(s.getTS(), 1000, time.Now()), pk1))
@@ -137,10 +125,10 @@ func (s *testSharedLockSuite) TestExclusiveLockBlockSharedLock() {
 		txn2 := s.begin()
 		txn3 := s.begin()
 
-		pk1 := []byte("exclusive_lock_pk1")
-		pk2 := []byte("exclusive_lock_pk2")
-		pk3 := []byte("exclusive_lock_pk2")
-		key := []byte("exclusive_lock_key")
+		pk1 := []byte("pk1")
+		pk2 := []byte("pk2")
+		pk3 := []byte("pk3")
+		key := []byte("shared_lock_key")
 
 		s.Nil(txn1.LockKeys(context.Background(), kv.NewLockCtx(s.getTS(), 1000, time.Now()), pk1))
 		s.Equal(txn1.GetCommitter().GetPrimaryKey(), pk1)
