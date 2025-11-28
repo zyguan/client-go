@@ -71,13 +71,13 @@ func (s *testSharedLockSuite) getTS() uint64 {
 	return ts
 }
 
-func (s *testSharedLockSuite) loadLock(key []byte) *txnlock.Lock {
-	locks, err := s.store.ScanLocks(context.Background(), key, append(key, 0), s.getTS())
+func (s *testSharedLockSuite) scanLocks(key []byte, maxTS uint64) []*txnlock.Lock {
+	locks, err := s.store.ScanLocks(context.Background(), key, append(key, 0), maxTS)
 	s.Nil(err)
 	if len(locks) == 0 {
 		return nil
 	}
-	return locks[0]
+	return locks
 }
 
 func (s *testSharedLockSuite) TestSharedLockBlockExclusiveLock() {
@@ -101,7 +101,6 @@ func (s *testSharedLockSuite) TestSharedLockBlockExclusiveLock() {
 		s.Equal(txn2.GetCommitter().GetPrimaryKey(), pk2)
 		lockctx2 := kv.NewLockCtx(s.getTS(), 1000, time.Now())
 		lockctx2.InShareMode = true
-		fmt.Println(lockctx2.ForUpdateTS)
 		s.Nil(txn2.LockKeys(context.Background(), lockctx2, key))
 
 		flags, err := txn2.GetMemBuffer().GetFlags(key)
@@ -205,8 +204,9 @@ func (s *testSharedLockSuite) TestResolveSharedLock() {
 	txn1.SetSessionID(1)
 	s.Nil(txn1.Commit(context.Background()))
 
-	lock := s.loadLock(key)
-	s.NotNil(lock)
+	locks := s.scanLocks(key, s.getTS())
+	s.Len(locks, 1)
+	lock := locks[0]
 	s.Equal(key, lock.Key)
 	s.Equal(pk, lock.Primary)
 
@@ -218,7 +218,9 @@ func (s *testSharedLockSuite) TestResolveSharedLock() {
 	s.Equal(pk, txn2.GetCommitter().GetPrimaryKey())
 	s.Nil(txn2.LockKeys(context.Background(), kv.NewLockCtx(s.getTS(), 1000, time.Now()), key))
 
-	lock = s.loadLock(key)
+	locks = s.scanLocks(key, s.getTS())
+	s.Len(locks, 1)
+	lock = locks[0]
 	s.NotNil(lock)
 	s.Equal(key, lock.Key)
 	s.Equal(pk, lock.Primary)
@@ -226,6 +228,99 @@ func (s *testSharedLockSuite) TestResolveSharedLock() {
 	s.False(lock.IsShared())
 
 	s.Nil(txn2.Rollback())
-	s.Nil(s.loadLock(key))
+	s.Len(s.scanLocks(key, s.getTS()), 0)
 	s.Nil(failpoint.Disable("tikvclient/beforeCommitSecondaries"))
+}
+
+func (s *testSharedLockSuite) TestScanSharedLock() {
+	pk1 := []byte("shared_lock_pk_1")
+	pk2 := []byte("shared_lock_pk_2")
+	pk3 := []byte("shared_lock_pk_3")
+	sharedKey := []byte("shared_lock_key")
+	txn1 := s.begin()
+	txn2 := s.begin()
+	txn3 := s.begin()
+
+	pks := [][]byte{pk1, pk2, pk3}
+	txns := []transaction.TxnProbe{txn1, txn2, txn3}
+
+	for i, txn := range txns {
+		s.Nil(txn.LockKeys(context.Background(), kv.NewLockCtx(s.getTS(), 1000, time.Now()), pks[i]))
+		s.Equal(pks[i], txn.GetCommitter().GetPrimaryKey())
+		lockCtx := kv.NewLockCtx(s.getTS(), 1000, time.Now())
+		lockCtx.InShareMode = true
+		s.Nil(txn.LockKeys(context.Background(), lockCtx, sharedKey))
+	}
+
+	maxTS2LockNum := map[uint64]int{
+		txn1.StartTS() - 1: 0,
+		txn1.StartTS():     1,
+		txn2.StartTS():     2,
+		txn3.StartTS():     3,
+	}
+	for maxTS, lockNum := range maxTS2LockNum {
+		locks := s.scanLocks(sharedKey, maxTS)
+		s.Equal(len(locks), lockNum, fmt.Sprintf("when maxTS=%d, expect %d locks", maxTS, lockNum))
+		for _, lock := range locks {
+			s.Equal(sharedKey, lock.Key)
+			s.LessOrEqual(lock.TxnID, maxTS)
+		}
+	}
+
+	for _, txn := range txns {
+		s.Nil(txn.Rollback())
+	}
+	locks, err := s.store.ScanLocks(context.Background(), sharedKey, append(sharedKey, 0), txn3.StartTS())
+	s.Nil(err)
+	s.Equal(len(locks), 0, "no locks after rollback")
+}
+
+func (s *testSharedLockSuite) TestGCSharedLock() {
+	originManagedLockTTL := atomic.LoadUint64(&transaction.ManagedLockTTL)
+	atomic.StoreUint64(&transaction.ManagedLockTTL, 100) // 100ms
+	defer atomic.StoreUint64(&transaction.ManagedLockTTL, originManagedLockTTL)
+
+	txn1 := s.begin()
+	txn2 := s.begin()
+	txn3 := s.begin()
+	pk1 := []byte("shared_lock_gc_pk1")
+	pk2 := []byte("shared_lock_gc_pk2")
+	pk3 := []byte("shared_lock_gc_pk3")
+	sharedKey := []byte("shared_lock_gc_key")
+
+	pks := [][]byte{pk1, pk2, pk3}
+	txns := []transaction.TxnProbe{txn1, txn2, txn3}
+
+	for i, txn := range txns {
+		s.Nil(txn.LockKeys(context.Background(), kv.NewLockCtx(s.getTS(), 1000, time.Now()), pks[i]))
+		s.Equal(pks[i], txn.GetCommitter().GetPrimaryKey())
+		lockCtx := kv.NewLockCtx(s.getTS(), 1000, time.Now())
+		lockCtx.InShareMode = true
+		s.Nil(txn.LockKeys(context.Background(), lockCtx, sharedKey))
+	}
+	// keep heartbeat for txn3 only
+	txn1.GetCommitter().CloseTTLManager()
+	txn2.GetCommitter().CloseTTLManager()
+
+	locks := s.scanLocks(sharedKey, s.getTS())
+	s.Len(locks, 3)
+	for _, lock := range locks {
+		s.Equal(sharedKey, lock.Key)
+		s.True(lock.IsShared())
+	}
+
+	// wait managed lock ttl to expire
+	time.Sleep(time.Duration(atomic.LoadUint64(&transaction.ManagedLockTTL))*time.Millisecond + 200*time.Millisecond)
+
+	lr := s.store.NewLockResolver()
+	bo := tikv.NewGcResolveLockMaxBackoffer(context.Background())
+	ttl, err := lr.ResolveLocks(bo, 0, locks)
+	s.Nil(err)
+	s.Zero(ttl)
+
+	locks = s.scanLocks(sharedKey, s.getTS())
+	s.Len(locks, 1)
+	s.Equal(txn3.StartTS(), locks[0].TxnID)
+	s.Equal(sharedKey, locks[0].Key)
+	s.Nil(txn3.Rollback())
 }
